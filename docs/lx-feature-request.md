@@ -4,21 +4,15 @@
 
 ---
 
-## Option to pin a component's OSC address
+## Option to lock a component's OSC address
 
-Renaming a channel or a modulator changes its OSC address, so any external controller
-pointed at it silently stops working. Same if a modulator gets moved to a different
-parent. Nothing errors — the control just goes dead, and you usually find out much
-later.
+When you rename or move a component, its OSC address changes and anything external
+pointed at it breaks.
 
-We drive a show from Bitwig with ~25 senders hitting different macro banks, so a
-rename while building is a breakage we don't notice until something looks wrong on
-stage.
-
-**Suggested fix:** let a component's OSC path be set explicitly and pinned, so it
-stops tracking the label and survives being renamed or moved. Right-click →
-"Set OSC address…" on the component would cover it. Doing it just for `MacroKnobs` /
-`MacroTriggers` would handle almost all external-control use.
+**Suggested fix:** either be able to set a custom OSC path that stays fixed, or be
+able to lock the existing path so it doesn't change when the component is moved or
+renamed. Right-click → "Set OSC address…" / "Lock OSC address" would cover it. Just
+`MacroKnobs` / `MacroTriggers` would handle almost all external-control use.
 
 **Separately, if it's ever cheap:** a "last received" indicator on a component would
-make a dead link obvious immediately.
+make a dead link obvious.
