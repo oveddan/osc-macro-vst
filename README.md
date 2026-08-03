@@ -62,10 +62,10 @@ Remaining:
 
 - **Reset-on-load defaults** — per-macro initial value, default 0, with an opt-out
   for macros that are hand-set rather than modulated. This is the stale-knob fix.
-- **Minimal editor** — a name field, a status line (OSC target, sending or not), and
-  a "regenerate ID" button for resolving duplicates. Required because VST3 parameters
-  cannot be strings, and Bitwig's generic parameter panel does not allow typing an
-  exact value, so nothing human-editable can be a parameter.
+- **Minimal editor** — a name field and a status line (OSC target, sending or not).
+  Required because VST3 parameters cannot be strings, and Bitwig's generic parameter
+  panel does not allow typing an exact value, so nothing human-editable can be a
+  parameter.
 - **Identity = a self-generated UUID, with a human name as a separate field.**
   Decided — see "Identity" below. Change this before the editor is written; the
   prototype currently keys config by slot number.
@@ -162,8 +162,8 @@ with the probe plugin and read the log.
 |---|---|---|---|
 | 1 | Copy a track containing the VST into **another project** | Config travels in the state chunk; no file entry needed; instance keeps working | Implied by the moved-file test; **verify explicitly** |
 | 2 | **Two Bitwig tabs** open, one audio engine active, both containing an instance with the same name; edit the config file | Only affects instances that are loaded. Depends on capability test 3 | **untested** |
-| 3 | Same UUID present in **two unrelated projects** (a track copied between them); edit the file | Both get updated — they share one config entry. Regenerate the ID on one if they should diverge | **untested** |
-| 4 | **Duplicate a track within one project** | Two instances share a UUID → one config entry, one OSC address → last-packet-wins. Must be detected and reported, never auto-rekeyed | partially implemented (duplicate-destination detection); **verify** |
+| 3 | Same UUID present in **two unrelated projects** (a track copied between them); edit the file | Both get updated — they share one config entry | **untested**; related to the deferred duplication limitation |
+| 4 | **Duplicate a track within one project** | Two instances share a UUID → one config entry, one OSC address → last-packet-wins | **known limitation, deferred** — see "Duplicating a track". Workaround: re-point the copy by hand |
 | 5 | Project moved to another machine **without** the config file | Cached state keeps everything working | **verified** |
 | 6 | **Offline bounce / render** | OSC suppressed — a bounce must not disturb a live rig | implemented, **unverified** |
 | 7 | **Device turned off** | Processing and modulation stop; recover on re-enable | **verified** — known limitation, keep devices enabled |
@@ -246,48 +246,26 @@ That UUID is the config key. A separate `name` field carries the human label:
   the name and prefix on an entry that already exists.
 - **Travels with a copied track**, since it lives in the state chunk.
 
-### Duplicating a track
+### Duplicating a track — known limitation, deferred
 
-**Duplication copies the UUID.** The host copies the state chunk verbatim, and the
-plugin cannot tell the difference — a duplicate and an ordinary project load both
-arrive as `setStateInformation` with identical bytes. There is no VST3 signal for
-"you were just cloned".
+Duplicating a track copies the state chunk verbatim, UUID included, so both instances
+share one config entry and send to the same OSC address. Last-packet-wins, which looks
+like jitter rather than an obvious failure.
 
-Note this is **not a regression**: duplicating a track with OSCpar today produces two
-devices sending to the same OSC path, silently. The improvement available here is
-making it loud.
+The plugin cannot detect this on its own: a duplicate and an ordinary project load both
+arrive as `setStateInformation` with identical bytes, and VST3 gives no "you were just
+cloned" signal.
 
-**Detection.** Keep a process-wide static registry of live UUIDs. On state restore,
-if another live instance already claims yours, you are a duplicate. Reliable within a
-process, costs nothing.
+**Not a regression** — duplicating a track with OSCpar today produces two devices on
+the same OSC path, equally silently. Logged as a known bug to solve later rather than
+designed around now. Workaround for the moment: after duplicating a track, point the
+copy at a different destination by hand.
 
-**Behaviour on detection** — the second instance to claim a UUID should:
-
-1. mark itself duplicate
-2. **stop sending** until resolved
-3. show a warning in its editor with a "regenerate ID" button
-
-Stopping matters. Two instances on one address produce jittering values that look
-like a Chromatik fault or a flaky LFO and are genuinely hard to diagnose. One silent
-instance with a visible warning is a five-second fix.
-
-**On regenerate, clone the config entry** under the new UUID rather than starting
-blank — a duplicated track usually wants the same prefix and scaling, just re-pointed.
-
-**Whether this can be automatic depends on host-capability test 2.** Bitwig runs
-multiple tabs in one process, so two legitimately separate projects each containing a
-copied track collide identically to a real duplicate:
-
-| same UUID, ... | verdict |
-|---|---|
-| same project path | genuine duplicate — safe to auto-resolve |
-| different project path | two tabs of different projects — leave alone |
-
-If `IStreamAttributes` supplies a project path, that distinction is available and
-duplicates can be resolved automatically. **Without it, report only — never
-auto-rekey**, since doing so would silently mutate a legitimate instance. The
-cross-tab false positive is mostly harmless in practice because only one tab has an
-active audio engine, but that relies on capability test 3.
+Notes for whenever it is picked up: a process-wide registry of live UUIDs would detect
+the collision, but Bitwig runs multiple tabs in one process, so two separate projects
+each containing a copied track look identical to a real duplicate. Host-capability
+test 2 (project path via `IStreamAttributes`) is what would make them distinguishable
+and the fix automatic.
 
 **Config file** — `~/.chromatik-macros/mappings.json`, watched:
 
