@@ -115,7 +115,8 @@ multi-project edge cases below.
 **Decide the product name before any show project is built on this.** A VST3's name
 and class ID are written into every project that uses it. Renaming afterwards means
 every existing project fails to resolve the device and loses its modulation
-assignments. This is a now-or-never decision, unlike almost everything else here.
+assignments. This is the *only* now-or-never decision here — adding formats, features
+or config fields later is all additive.
 
 `ChromatikMacro` is too narrow. Nothing about the plugin is Chromatik-specific — it
 is a generic "expose N modulatable parameters and stream them as OSC" device.
@@ -135,9 +136,15 @@ host. Points to keep in mind:
 - **`updateTrackProperties()`** (capability test 1) is well supported in Live and
   Logic. If it works there but not in Bitwig, automatic labels may be a
   host-dependent nicety rather than something to design around.
-- **Consider building AU as well as VST3** for Logic and Live on macOS. JUCE makes
-  this a one-line change in `CMakeLists.txt` (`FORMATS VST3 AU`), and it is far
-  cheaper to add now than to retrofit once projects exist.
+- **VST3 only. Do not build AU.** Bitwig does not host Audio Units at all (VST2,
+  VST3 and CLAP only), and Ableton Live on macOS takes VST3. AU is needed solely for
+  Logic Pro and GarageBand, which are not in use here. Adding a format later is
+  **additive and non-breaking** — the VST3 keeps its class ID and existing projects
+  are unaffected — so there is no reason to do it pre-emptively. (`FORMATS VST3 AU`
+  in `CMakeLists.txt` whenever it is actually wanted.)
+- CLAP would be the more interesting future format for Bitwig specifically, but JUCE 8
+  does not support it natively — it needs the third-party `clap-juce-extensions`
+  wrapper. Not worth it unless a concrete need appears.
 - Nothing in the config format, OSC output or state handling is host-specific.
 
 ---
