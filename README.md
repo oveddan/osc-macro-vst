@@ -1,4 +1,4 @@
-# ChromatikMacro
+# OSCMacro
 
 A VST3 plugin that streams DAW modulation to any OSC receiver. A direct replacement
 for the third-party **OSCpar** plugin, addressing specific annoyances with it (below)
@@ -8,8 +8,7 @@ per destination.
 **This is not Chromatik-specific and not Bitwig-specific.** Nothing in the design ties
 it to either — it sends OSC to a configurable host, port and prefix, from any VST3
 host. Chromatik/LX is simply the receiver it is being built for first, and Bitwig the
-host it is being tested in. See "Naming and portability" — the product name needs
-deciding *before* any show projects are built on it.
+host it is being tested in.
 
 **Status: v1 implementation complete; final host validation remains.** File-backed
 mappings, UUID identity, cached state, rate-limited OSC, hot reload, reset-on-load,
@@ -117,16 +116,17 @@ multi-project edge cases below.
 
 ## Naming and portability
 
-**Decide the product name before any show project is built on this.** A VST3's name
-and class ID are written into every project that uses it. Renaming afterwards means
-every existing project fails to resolve the device and loses its modulation
-assignments. This is the *only* now-or-never decision here — adding formats, features
-or config fields later is all additive.
+The final product name is **OSCMacro**: a generic "expose N modulatable parameters
+and stream them as OSC" device. Neither the product nor its config path names a host
+or receiver.
 
-`ChromatikMacro` is too narrow. Nothing about the plugin is Chromatik-specific — it
-is a generic "expose N modulatable parameters and stream them as OSC" device.
-Something like `OscMacro` / `MacroOut` describes what it actually is. The repo name
-matters much less and can change any time.
+The prototype's VST3 class ID (`Dovd` / `Cmac`) is intentionally retained so the
+existing Bitwig test project can resolve the renamed plugin without losing parameter
+assignments. Its internal `ChromatikMacro` state-tree type is also retained solely for
+backward-compatible state restoration; neither legacy identifier is user-facing.
+The repository directory and remote can be renamed independently. Verified in
+Bitwig: the existing test project resolved the device as OSCMacro with its previous
+macro assignments intact.
 
 ### Host portability
 
@@ -162,7 +162,7 @@ with the probe plugin and read the log.
 | # | question | why it matters |
 |---|---|---|
 | 1 | Does Bitwig populate JUCE's `updateTrackProperties()` (track name, colour)? | If yes, instances get automatic sensible labels ("Moon", "WildRain") with no user action. Note two instances on one track would both report the same name, so it is a default, not an identity. |
-| 2 | Does Bitwig attach a file path via VST3 `IStreamAttributes` on state load? | If yes, config can be scoped per project (`~/.chromatik-macros/<project>.json`) and the multi-tab problem disappears. If no, scope by name instead. |
+| 2 | Does Bitwig attach a file path via VST3 `IStreamAttributes` on state load? | If yes, config can be scoped per project (`~/.osc-macro/<project>.json`) and the multi-tab problem disappears. If no, scope by name instead. |
 | 3 | Are plugin instances live in an **inactive Bitwig tab**? | Only one tab has an active audio engine. If inactive-tab instances are unloaded, the cross-tab config problem is moot. If they are loaded but not processing, their config watcher is still running and will adopt file edits. |
 | 4 | Can an exact value be typed into a parameter in Bitwig's generic panel? | **Already answered: no.** This is why identity is a name in an editor, not a numeric parameter. |
 
@@ -180,7 +180,7 @@ with the probe plugin and read the log.
 | 6 | **Offline bounce / render** | OSC suppressed — a bounce must not disturb a live rig | implemented, **unverified** |
 | 7 | **Device turned off** | Processing and modulation stop; recover on re-enable | **verified** — known limitation, keep devices enabled |
 | 8 | **Silent track while transport runs**, other tracks producing audio | Modulation continues | **untested — highest remaining risk.** Distinct from stopped transport; this is the per-device smart-suspend case and the actual show condition |
-| 9 | **Malformed or invalid config file** | Keep last valid mapping, report in `~/.chromatik-macros/plugin.log` | implemented, **unverified** |
+| 9 | **Malformed or invalid config file** | Keep last valid mapping, report in `~/.osc-macro/plugin.log` | implemented, **unverified** |
 | 10 | Two active instances configured to the **same OSC destination** | Detect, log, suppress until resolved; inactive instances relinquish ownership | implemented, **unverified** |
 | 11 | **Reset-on-load**: save mid-timeline with macros at non-zero, reopen | Macros return to their configured initial value (default 0), not the saved position | **verified** — macro2 saved at 0.83 and reopened at 0.0 |
 
@@ -214,7 +214,7 @@ reopening `ChromatikMacroTest` without touching the control, its OSC snapshot re
 
 ### Prototype validation log — 2026-08-02
 
-Setup: ChromatikMacro on Slot 1, transport stopped. A Bitwig LFO modulated `macro1`;
+Setup: the prototype (then named ChromatikMacro) on Slot 1, transport stopped. A Bitwig LFO modulated `macro1`;
 `macro2` and `macro3` held static. `mappings.json` targeted a temporary UDP receiver
 at `127.0.0.1:39031`, not the live Chromatik port. Macros 1–3 enabled at
 `/chromatik-macro/test`.
@@ -237,9 +237,11 @@ at `127.0.0.1:39031`, not the live Chromatik port. Macros 1–3 enabled at
   project restored the cached prefix, bipolar scale, macro values, continuous LFO
   stream and periodic snapshots without the file. The file was then restored.
 
-The temporary mapping at `~/.chromatik-macros/mappings.json` still points to port
-39031 and is harmless when no test receiver is running. Replace it with production
-mappings before testing against Chromatik on port 3030.
+The temporary mapping migrates automatically from
+`~/.chromatik-macros/mappings.json` to `~/.osc-macro/mappings.json` on first run and
+still points to port 39031. It is harmless when no test receiver is running. Replace
+it with production mappings before testing against Chromatik on port 3030. The
+one-time migration was verified byte-for-byte after loading OSCMacro in Bitwig.
 
 ---
 
@@ -280,7 +282,9 @@ signal. Project path via `IStreamAttributes` (host-capability test 2) may eventu
 make true within-project duplication distinguishable from a copied track in another
 project. Separate host processes cannot share the in-process collision registry.
 
-**Config file** — `~/.chromatik-macros/mappings.json`, watched:
+**Config file** — `~/.osc-macro/mappings.json`, watched. If it does not yet exist,
+OSCMacro imports the legacy `~/.chromatik-macros/mappings.json` once and leaves the
+legacy file untouched:
 
 ```json
 {
@@ -302,7 +306,7 @@ what LX expects for ranged parameters. `target` defaults to `127.0.0.1:3030`, `s
 defaults to `[0,1]`, `initial` defaults to `0`. An empty `prefix` means the instance
 is unconfigured and emits nothing. Only macros present in the mapping emit OSC.
 Invalid edits retain the last valid mapping and are reported in
-`~/.chromatik-macros/plugin.log`.
+`~/.osc-macro/plugin.log`.
 
 Editing by hand or by agent works by locating the entry via its `name` field, so the
 UUIDs stay out of the way.
@@ -360,13 +364,9 @@ XML inside a ZIP appended to the `.bwproject` file:
 </Preset>
 ```
 
-25 such instances exist in the current show. A working extractor already exists — see
-the `bitwig-project` skill at `~/Source/bitwig-osc-bridge/.agents/skills/bitwig-project/`
-(`scripts/bwproject.py presets <file>`), which also documents the `.bwproject` format
-and its parsing traps.
-
-Current show project:
-`/Users/danoved/Dropbox/Projects/Apotheneum-DanO/Bitwig Project/Apotheneum/TreetopTransmission-Burn26.bwproject`
+The current show contains 25 such instances. The migration uses an existing local
+`.bwproject` preset extractor (`bwproject.py presets <file>`); that extractor and the
+show project are not part of this repository.
 
 ### How much of the switchover can be scripted?
 
@@ -455,8 +455,8 @@ Built plugin lands in `~/Library/Audio/Plug-Ins/VST3/`.
 
 ## Related, and one live hazard
 
-- `~/Source/bitwig-osc-bridge` — a Bitwig controller extension doing the same job a
-  different way. **Hazard: it currently holds ~48 bindings pointing at many of the
+- A separate Bitwig controller extension can do the same job a different way.
+  **Hazard: the current rig has ~48 bindings pointing at many of the
   same Chromatik macros that OSCpar devices in the show project also drive.** Two
   senders on one address is last-packet-wins and looks like random jitter. Clear its
   slots before running the show, or before testing this plugin against port 3030.
@@ -466,4 +466,4 @@ Built plugin lands in `~/Library/Audio/Plug-Ins/VST3/`.
 - Chromatik OSC receive: `127.0.0.1:3030`.
 - Channel names work in OSC addresses (`/lx/mixer/channel/Sunrise/...`) — verified
   live; they do not have to be numeric indices.
-- LX source for reference: `~/Source/lx`
+- LX source is useful for reference when extending the Chromatik receiver side.

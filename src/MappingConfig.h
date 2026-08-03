@@ -4,7 +4,7 @@
 
 #include <array>
 
-namespace chromatik
+namespace oscmacro
 {
 constexpr auto macroCount = 8;
 

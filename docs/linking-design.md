@@ -158,7 +158,7 @@ The orphaned row is the failure that is invisible under every other option here.
 | location | role |
 |---|---|
 | VST state chunk | authoritative for that instance; verified to survive a missing `mappings.json` |
-| `~/.chromatik-macros/mappings.json` | editing surface — MCP writes it, the plugin adopts changes |
+| `~/.osc-macro/mappings.json` | editing surface — MCP writes it, the plugin adopts changes |
 | LX component | authoritative for the Chromatik end; set by Listen |
 
 Two independent declarations that must agree, plus a registry that reports when

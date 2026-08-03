@@ -2,7 +2,7 @@
 
 #include <cmath>
 
-namespace chromatik
+namespace oscmacro
 {
 namespace
 {

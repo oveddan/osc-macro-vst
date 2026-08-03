@@ -22,7 +22,18 @@ constexpr auto processingHeartbeatTimeoutMs = 1000;
 constexpr auto registryRetryIntervalMs = 1000;
 constexpr auto changeEpsilon = 0.0001f;
 
+juce::File configDirectory()
+{
+    return juce::File::getSpecialLocation (juce::File::userHomeDirectory)
+        .getChildFile (".osc-macro");
+}
+
 juce::File mappingsFile()
+{
+    return configDirectory().getChildFile ("mappings.json");
+}
+
+juce::File legacyMappingsFile()
 {
     return juce::File::getSpecialLocation (juce::File::userHomeDirectory)
         .getChildFile (".chromatik-macros")
@@ -35,11 +46,35 @@ std::mutex& mappingsWriteMutex()
     return instance;
 }
 
+juce::Result migrateLegacyConfigIfNeeded()
+{
+    const std::scoped_lock fileLock (mappingsWriteMutex());
+    const auto destination = mappingsFile();
+    const auto legacy = legacyMappingsFile();
+
+    if (destination.existsAsFile() || ! legacy.existsAsFile())
+        return juce::Result::ok();
+
+    if (destination.getParentDirectory().createDirectory().failed())
+        return juce::Result::fail ("Could not create "
+                                   + destination.getParentDirectory().getFullPathName());
+
+    juce::TemporaryFile temporary (destination);
+
+    if (! temporary.getFile().replaceWithText (legacy.loadFileAsString()))
+        return juce::Result::fail ("Could not stage legacy mappings migration");
+
+    if (! temporary.overwriteTargetFileWithTemporary())
+        return juce::Result::fail ("Could not migrate legacy mappings file");
+
+    return juce::Result::ok();
+}
+
 juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout()
 {
     juce::AudioProcessorValueTreeState::ParameterLayout layout;
 
-    for (auto index = 0; index < chromatik::macroCount; ++index)
+    for (auto index = 0; index < oscmacro::macroCount; ++index)
     {
         const auto id = "macro" + juce::String (index + 1);
         layout.add (std::make_unique<juce::AudioParameterFloat> (
@@ -52,7 +87,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout()
     return layout;
 }
 
-bool hasEnabledRoute (const chromatik::Mapping& mapping)
+bool hasEnabledRoute (const oscmacro::Mapping& mapping)
 {
     for (const auto& route : mapping.macros)
         if (route.enabled)
@@ -64,7 +99,7 @@ bool hasEnabledRoute (const chromatik::Mapping& mapping)
 class DestinationRegistry
 {
 public:
-    static bool acquire (const void* owner, const chromatik::Mapping& mapping)
+    static bool acquire (const void* owner, const oscmacro::Mapping& mapping)
     {
         auto keys = keysFor (mapping);
         const std::scoped_lock lock (mutex());
@@ -92,11 +127,11 @@ public:
     }
 
 private:
-    static std::vector<std::string> keysFor (const chromatik::Mapping& mapping)
+    static std::vector<std::string> keysFor (const oscmacro::Mapping& mapping)
     {
         std::vector<std::string> keys;
 
-        for (auto index = 0; index < chromatik::macroCount; ++index)
+        for (auto index = 0; index < oscmacro::macroCount; ++index)
             if (mapping.macros[static_cast<size_t> (index)].enabled)
                 keys.push_back ((mapping.host + ":" + juce::String (mapping.port)
                                  + mapping.addressFor (index)).toStdString());
@@ -128,8 +163,8 @@ juce::Result writeMappingEntry (const juce::File& file,
     const auto currentJson = file.existsAsFile() ? file.loadFileAsString() : juce::String();
     juce::String updatedJson;
 
-    if (const auto result = chromatik::upsertMappingName (currentJson, identity, name,
-                                                          fallbackResolvedJson, updatedJson);
+    if (const auto result = oscmacro::upsertMappingName (currentJson, identity, name,
+                                                         fallbackResolvedJson, updatedJson);
         result.failed())
         return result;
 
@@ -148,13 +183,13 @@ juce::Result writeMappingEntry (const juce::File& file,
 }
 }
 
-class ChromatikMacroProcessor;
+class OSCMacroProcessor;
 
-class ChromatikMacroEditor final : public juce::AudioProcessorEditor,
-                                   private juce::Timer
+class OSCMacroEditor final : public juce::AudioProcessorEditor,
+                             private juce::Timer
 {
 public:
-    explicit ChromatikMacroEditor (ChromatikMacroProcessor&);
+    explicit OSCMacroEditor (OSCMacroProcessor&);
 
     void paint (juce::Graphics&) override;
     void resized() override;
@@ -162,32 +197,33 @@ public:
 private:
     void timerCallback() override;
 
-    ChromatikMacroProcessor& owner;
+    OSCMacroProcessor& owner;
     juce::Label nameCaption;
     juce::Label nameEditor;
     juce::Label status;
 
-    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (ChromatikMacroEditor)
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (OSCMacroEditor)
 };
 
-class ChromatikMacroProcessor final : public juce::AudioProcessor,
-                                      private juce::AsyncUpdater
+class OSCMacroProcessor final : public juce::AudioProcessor,
+                                private juce::AsyncUpdater
 {
 public:
-    ChromatikMacroProcessor()
+    OSCMacroProcessor()
         : AudioProcessor (BusesProperties()
                               .withInput ("Input", juce::AudioChannelSet::stereo(), true)
                               .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
+          // Keep the legacy ValueTree type so existing Bitwig state chunks restore.
           parameters (*this, nullptr, "ChromatikMacro", createParameterLayout()),
           instanceIdentity (juce::Uuid().toString()),
           instanceName ("(unnamed)")
     {
-        for (auto index = 0; index < chromatik::macroCount; ++index)
+        for (auto index = 0; index < oscmacro::macroCount; ++index)
             macros[static_cast<size_t> (index)] =
                 parameters.getRawParameterValue ("macro" + juce::String (index + 1));
     }
 
-    ~ChromatikMacroProcessor() override
+    ~OSCMacroProcessor() override
     {
         stopWorker();
         cancelPendingUpdate();
@@ -258,7 +294,7 @@ public:
     bool hasEditor() const override { return true; }
     juce::AudioProcessorEditor* createEditor() override
     {
-        return new ChromatikMacroEditor (*this);
+        return new OSCMacroEditor (*this);
     }
 
     void getStateInformation (juce::MemoryBlock& destination) override
@@ -390,7 +426,7 @@ private:
                  persistedNameEditRevision };
     }
 
-    void updateResolvedMapping (const chromatik::Mapping& mapping,
+    void updateResolvedMapping (const oscmacro::Mapping& mapping,
                                 const juce::String& json)
     {
         auto changed = false;
@@ -456,7 +492,7 @@ private:
             persistedNameEditRevision = revision;
     }
 
-    void queueResetFromResolvedMapping (const chromatik::Mapping& mapping)
+    void queueResetFromResolvedMapping (const oscmacro::Mapping& mapping)
     {
         {
             const juce::ScopedLock lock (stateLock);
@@ -469,7 +505,7 @@ private:
             resetDispatchReady = true;
             resetDispatchIdentity = mapping.identity;
 
-            for (auto index = 0; index < chromatik::macroCount; ++index)
+            for (auto index = 0; index < oscmacro::macroCount; ++index)
             {
                 const auto& route = mapping.macros[static_cast<size_t> (index)];
                 resetDispatchEnabled[static_cast<size_t> (index)] =
@@ -483,8 +519,8 @@ private:
 
     void dispatchPendingReset()
     {
-        std::array<float, chromatik::macroCount> values {};
-        std::array<bool, chromatik::macroCount> enabled {};
+        std::array<float, oscmacro::macroCount> values {};
+        std::array<bool, oscmacro::macroCount> enabled {};
 
         {
             const juce::ScopedLock lock (stateLock);
@@ -497,7 +533,7 @@ private:
             enabled = resetDispatchEnabled;
         }
 
-        for (auto index = 0; index < chromatik::macroCount; ++index)
+        for (auto index = 0; index < oscmacro::macroCount; ++index)
         {
             if (! enabled[static_cast<size_t> (index)])
                 continue;
@@ -539,8 +575,8 @@ private:
     class Worker final : public juce::Thread
     {
     public:
-        explicit Worker (ChromatikMacroProcessor& processorToUse)
-            : Thread ("ChromatikMacro OSC"), processor (processorToUse)
+        explicit Worker (OSCMacroProcessor& processorToUse)
+            : Thread ("OSCMacro OSC"), processor (processorToUse)
         {
             lastSent.fill (std::numeric_limits<float>::quiet_NaN());
         }
@@ -552,6 +588,9 @@ private:
 
         void run() override
         {
+            if (const auto result = migrateLegacyConfigIfNeeded(); result.failed())
+                reportError (result.getErrorMessage());
+
             reloadMapping();
             auto lastConfigPoll = juce::Time::getMillisecondCounter();
 
@@ -619,9 +658,9 @@ private:
 
             if (file.existsAsFile())
             {
-                chromatik::Mapping candidate;
+                oscmacro::Mapping candidate;
                 juce::String resolvedJson;
-                const auto result = chromatik::parseMappingsFile (
+                const auto result = oscmacro::parseMappingsFile (
                     file.loadFileAsString(), currentIdentity, candidate, resolvedJson);
 
                 if (result.wasOk())
@@ -667,8 +706,8 @@ private:
                 || snapshot.cachedIdentity != snapshot.identity)
                 return hasMapping;
 
-            chromatik::Mapping candidate;
-            const auto result = chromatik::parseResolvedMapping (
+            oscmacro::Mapping candidate;
+            const auto result = oscmacro::parseResolvedMapping (
                 snapshot.cachedJson, snapshot.identity, candidate);
 
             if (result.wasOk())
@@ -681,7 +720,7 @@ private:
             return false;
         }
 
-        void applyMapping (const chromatik::Mapping& candidate,
+        void applyMapping (const oscmacro::Mapping& candidate,
                            const juce::String& sourceJson,
                            MappingSource source)
         {
@@ -813,7 +852,7 @@ private:
             const auto periodicSnapshot = now - lastSnapshot >= snapshotIntervalMs;
             auto sentAny = false;
 
-            for (auto index = 0; index < chromatik::macroCount; ++index)
+            for (auto index = 0; index < oscmacro::macroCount; ++index)
             {
                 const auto& route = mapping.macros[static_cast<size_t> (index)];
 
@@ -852,7 +891,7 @@ private:
             }
         }
 
-        static juce::String targetFor (const chromatik::Mapping& value)
+        static juce::String targetFor (const oscmacro::Mapping& value)
         {
             return value.host + ":" + juce::String (value.port);
         }
@@ -918,10 +957,10 @@ private:
                                   false, false, "\n");
         }
 
-        ChromatikMacroProcessor& processor;
+        OSCMacroProcessor& processor;
         juce::OSCSender sender;
-        chromatik::Mapping mapping;
-        std::array<float, chromatik::macroCount> lastSent {};
+        oscmacro::Mapping mapping;
+        std::array<float, oscmacro::macroCount> lastSent {};
         juce::String activeSourceJson;
         juce::String currentIdentity;
         juce::String lastError;
@@ -965,7 +1004,7 @@ private:
     }
 
     juce::AudioProcessorValueTreeState parameters;
-    std::array<std::atomic<float>*, chromatik::macroCount> macros {};
+    std::array<std::atomic<float>*, oscmacro::macroCount> macros {};
     std::atomic<bool> active { false };
     std::atomic<bool> offline { false };
     std::atomic<bool> resetInProgress { false };
@@ -983,19 +1022,19 @@ private:
     uint64_t persistedNameEditRevision = 0;
     juce::String resetRequestedIdentity;
     juce::String resetDispatchIdentity;
-    std::array<float, chromatik::macroCount> resetDispatchValues {};
-    std::array<bool, chromatik::macroCount> resetDispatchEnabled {};
+    std::array<float, oscmacro::macroCount> resetDispatchValues {};
+    std::array<bool, oscmacro::macroCount> resetDispatchEnabled {};
     bool resetAwaitingMapping = false;
     bool resetDispatchReady = false;
 
     mutable juce::CriticalSection statusLock;
     juce::String statusText { "inactive" };
 
-    friend class ChromatikMacroEditor;
-    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (ChromatikMacroProcessor)
+    friend class OSCMacroEditor;
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (OSCMacroProcessor)
 };
 
-ChromatikMacroEditor::ChromatikMacroEditor (ChromatikMacroProcessor& processorToUse)
+OSCMacroEditor::OSCMacroEditor (OSCMacroProcessor& processorToUse)
     : AudioProcessorEditor (processorToUse), owner (processorToUse)
 {
     nameCaption.setText ("Name", juce::dontSendNotification);
@@ -1022,12 +1061,12 @@ ChromatikMacroEditor::ChromatikMacroEditor (ChromatikMacroProcessor& processorTo
     startTimerHz (4);
 }
 
-void ChromatikMacroEditor::paint (juce::Graphics& graphics)
+void OSCMacroEditor::paint (juce::Graphics& graphics)
 {
     graphics.fillAll (getLookAndFeel().findColour (juce::ResizableWindow::backgroundColourId));
 }
 
-void ChromatikMacroEditor::resized()
+void OSCMacroEditor::resized()
 {
     auto area = getLocalBounds().reduced (12);
     auto nameRow = area.removeFromTop (32);
@@ -1037,7 +1076,7 @@ void ChromatikMacroEditor::resized()
     status.setBounds (area.removeFromTop (26));
 }
 
-void ChromatikMacroEditor::timerCallback()
+void OSCMacroEditor::timerCallback()
 {
     if (! nameEditor.isBeingEdited())
         nameEditor.setText (owner.getInstanceName(), juce::dontSendNotification);
@@ -1047,5 +1086,5 @@ void ChromatikMacroEditor::timerCallback()
 
 juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
 {
-    return new ChromatikMacroProcessor();
+    return new OSCMacroProcessor();
 }
