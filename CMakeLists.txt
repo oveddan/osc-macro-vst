@@ -25,13 +25,14 @@ juce_add_plugin(ChromatikMacro
   EDITOR_WANTS_KEYBOARD_FOCUS FALSE
   COPY_PLUGIN_AFTER_BUILD TRUE)
 
-target_sources(ChromatikMacro PRIVATE src/PluginProcessor.cpp)
+target_sources(ChromatikMacro PRIVATE
+  src/MappingConfig.cpp
+  src/PluginProcessor.cpp)
 
 target_compile_definitions(ChromatikMacro PUBLIC
   JUCE_WEB_BROWSER=0
   JUCE_USE_CURL=0
-  JUCE_VST3_CAN_REPLACE_VST2=0
-  JUCE_DISPLAY_SPLASH_SCREEN=0)
+  JUCE_VST3_CAN_REPLACE_VST2=0)
 
 target_link_libraries(ChromatikMacro PRIVATE
   juce::juce_audio_utils
@@ -39,3 +40,17 @@ target_link_libraries(ChromatikMacro PRIVATE
   PUBLIC
   juce::juce_recommended_config_flags
   juce::juce_recommended_warning_flags)
+
+include(CTest)
+
+if(BUILD_TESTING)
+  add_executable(ChromatikMacroTests
+    tests/MappingConfigTests.cpp
+    src/MappingConfig.cpp)
+  target_include_directories(ChromatikMacroTests PRIVATE src)
+  target_link_libraries(ChromatikMacroTests PRIVATE
+    juce::juce_core
+    juce::juce_recommended_config_flags
+    juce::juce_recommended_warning_flags)
+  add_test(NAME mapping-config COMMAND ChromatikMacroTests)
+endif()

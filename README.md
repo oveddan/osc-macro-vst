@@ -1,117 +1,268 @@
 # ChromatikMacro
 
-A VST3 plugin that streams Bitwig modulation to Chromatik/LX over OSC, configured
-from a JSON file that MCP can write. Intended to replace the third-party **OSCpar**
-plugin, and to retire the `bitwig-osc-bridge` controller extension entirely.
+A VST3 plugin that streams DAW modulation to any OSC receiver. A direct replacement
+for the third-party **OSCpar** plugin, addressing specific annoyances with it (below)
+while keeping the same basic model: N macro parameters, an OSC prefix, one instance
+per destination.
 
-**Status: not built yet.** `CMakeLists.txt` exists; no source written. Start with
-the blocking test below — everything else is contingent on it.
+**This is not Chromatik-specific and not Bitwig-specific.** Nothing in the design ties
+it to either — it sends OSC to a configurable host, port and prefix, from any VST3
+host. Chromatik/LX is simply the receiver it is being built for first, and Bitwig the
+host it is being tested in. See "Naming and portability" — the product name needs
+deciding *before* any show projects are built on it.
 
----
+**Status: v1 prototype built and largely validated.** File-backed mappings, cached
+state, rate-limited OSC, hot reload and project-dirty notification all work and are
+tested (see validation log). Remaining v1 work: reset-on-load defaults, a minimal
+editor, and the host-capability and edge-case tests listed below.
 
-## Why
-
-The existing approach (`~/Source/bitwig-osc-bridge`) is a Bitwig *controller
-extension* that reads **remote controls** and forwards their values to OSC. That
-works, but it forces:
-
-- exposing every modulator and Grid output on a remote-controls page by hand
-- "probe" cursors to reach devices nested inside Grid chains
-- an 8-knob-per-page limit, so banks spill onto second pages
-- track coordinates (`t25.d1.k2`) that churn whenever tracks are added or reordered
-
-A **plugin parameter is addressable wherever it sits**. You modulate it in place,
-exactly like OSCpar today. All of the above disappears.
-
-A full session was spent mapping ~48 bindings through the extension, and most of
-the difficulty was this plumbing rather than the actual mapping.
+**Scope note:** this is now scoped as an *OSCpar replacement*, not the larger
+Bitwig↔Chromatik linking redesign. Prefix-based addressing stays. The Chromatik-side
+component and discovery work is deferred to v2 — see "Deferred to v2".
 
 ---
 
-## THE BLOCKING TEST — do this first
+## Why build this rather than keep OSCpar
 
-The controller extension subscribes to `RemoteControl.modulatedValue()`, which the
-host pushes **independently of audio processing**. A VST3 plugin only receives
-parameter changes during `processBlock()`.
+OSCpar works. The case for replacing it rests mainly on one recurring, per-session
+annoyance; the rest are setup-time costs that are already largely paid.
 
-**So: if Bitwig suspends, bypasses, or sleeps the device, modulation may stop
-reaching the plugin entirely.** If that happens, this whole design is dead and the
-extension stays.
+| annoyance | severity | fixed here? |
+|---|---|---|
+| **Macro values restore stale on project load.** Save mid-timeline with a knob at 50%, reopen, and it is still at 50%. Every session means manually turning every macro down, saving at position 0, then playing so modulation takes over. | **every session** | yes — see reset-on-load |
+| New instance defaults to 0–255 scaling on every macro, fixed by hand each time | setup | yes — configurable defaults |
+| Config only editable through its own UI, one instance at a time; no bulk edit, not scriptable | setup / repair | yes — watched config file |
+| Costs money, per-machine licensing | one-off | yes |
+| No signal when a link is dead | continuous, low-grade | partly — needs the Chromatik side (v2) |
+| Prefix breaks silently when a Chromatik component is renamed or moved | rare | no — v2 linking work |
 
-Build a stub that logs, from a **non-audio thread**, every ~250ms:
+**The stale-value problem is the main justification.** It is the only item that taxes
+every working session rather than initial setup.
 
-- wall-clock timestamp
-- number of `processBlock()` calls since the last line
-- the current value of each macro parameter
+### Not needed from OSCpar
 
-Then in Bitwig, assign a Grid output / LFO / Follower to a macro parameter and
-check whether values keep updating when:
+- 10 macros — 8 is sufficient for every bank in the current show
+- `PassTransport`
+- per-macro `Type` settings (verify nothing in the show relies on these)
+
+---
+
+## v1 scope
+
+Already built and validated:
+
+- 8 macro float parameters, modulatable from Bitwig
+- OSC output, rate-limited ~50Hz with epsilon suppression and coalescing
+- Full snapshot on load, on mapping change, and every 5s
+- Watched config file with hot reload
+- Cached config in the plugin state chunk
+- Project-dirty notification on external config change
+
+Remaining:
+
+- **Reset-on-load defaults** — per-macro initial value, default 0, with an opt-out
+  for macros that are hand-set rather than modulated. This is the stale-knob fix.
+- **Minimal editor** — a name field plus a status line (OSC target, sending or not).
+  Required because VST3 parameters cannot be strings, and Bitwig's generic parameter
+  panel does not allow typing an exact value, so identity cannot be a numeric
+  parameter.
+- **Identity = name, not slot number.** Decided: a name reads better, avoids the
+  can't-type-exact-values problem, and collides across projects only when it
+  genuinely means the same thing (every project has a slot 7; only related projects
+  have a `MoonOut`). Change this before the editor is written — it is awkward once
+  projects have slot numbers baked in.
+- Host-capability and edge-case tests below.
+
+### Config semantics — important
+
+Three rules, two of which are already implemented and verified:
+
+1. **Plugin state is authoritative.** Config travels inside the plugin, so a track
+   copied to another project carries its configuration with it. *(verified)*
+2. **A missing file entry means "keep what you have"**, never "clear". *(verified —
+   the moved-file test)*
+3. **The config file only ever pushes.** It is a bulk-edit surface for whatever
+   project is currently open, not a database of all instances.
+
+Framing the file as a *bulk editor rather than a database* resolves most of the
+multi-project edge cases below.
+
+---
+
+## Deferred to v2
+
+- MCP/API control of config (currently a hand- or agent-edited text file)
+- **Master UI** — because every instance reads the same config file, any instance's
+  editor can render all instances with the current one highlighted. No separate app
+  or process needed.
+- Chromatik-side `BitwigLink` component with a discovered-source picker.
+  **Verified feasible:** `lx.engine.osc.addListener()` exists, and custom listeners
+  receive *every* incoming message (see `LXOscEngine.EngineListener.oscMessage`,
+  dispatch loop is unconditional), on the **engine thread** — the socket thread only
+  parses and enqueues, `LXOscEngine.dispatch()` drains to `engineThreadEventQueue`
+  and then invokes listeners. So a discovery component needs no locking.
+  - Gotcha: `shouldAddressBeExcluded(prefixFilters, ...)` runs before listener
+    dispatch. A prefix filter on the connection would silently drop messages.
+  - Gotcha: with no custom listener registered, unmatched addresses throw and log
+    per message — at 50Hz that floods the log. Register the listener before sending.
+- Activity / last-seen indicator inside the Chromatik module. Cheap when wanted:
+  Chromatik is the receiver, so it needs no reply path or protocol change. An
+  indicator inside the *VST* would need one, and is not planned.
+- Trigger variant for the `Palette` and `Monkeys` banks (`MacroTriggers` in Chromatik).
+
+---
+
+## Naming and portability
+
+**Decide the product name before any show project is built on this.** A VST3's name
+and class ID are written into every project that uses it. Renaming afterwards means
+every existing project fails to resolve the device and loses its modulation
+assignments. This is a now-or-never decision, unlike almost everything else here.
+
+`ChromatikMacro` is too narrow. Nothing about the plugin is Chromatik-specific — it
+is a generic "expose N modulatable parameters and stream them as OSC" device.
+Something like `OscMacro` / `MacroOut` describes what it actually is. The repo name
+matters much less and can change any time.
+
+### Host portability
+
+The plugin uses only standard VST3/JUCE facilities, so it should work in any VST3
+host. Points to keep in mind:
+
+- **Ableton Live** has no Bitwig-style modulators. You would drive the macros with
+  automation, Max for Live LFOs, or macro mapping. The parameters are ordinary
+  automatable floats, so all of that works — but the blocking-test results below were
+  measured in Bitwig and would need re-checking per host, especially device
+  suspension behaviour.
+- **`updateTrackProperties()`** (capability test 1) is well supported in Live and
+  Logic. If it works there but not in Bitwig, automatic labels may be a
+  host-dependent nicety rather than something to design around.
+- **Consider building AU as well as VST3** for Logic and Live on macOS. JUCE makes
+  this a one-line change in `CMakeLists.txt` (`FORMATS VST3 AU`), and it is far
+  cheaper to add now than to retrofit once projects exist.
+- Nothing in the config format, OSC output or state handling is host-specific.
+
+---
+
+## Host-capability tests to run
+
+All four are cheap, and each removes or creates work. Run them together in one pass
+with the probe plugin and read the log.
+
+| # | question | why it matters |
+|---|---|---|
+| 1 | Does Bitwig populate JUCE's `updateTrackProperties()` (track name, colour)? | If yes, instances get automatic sensible labels ("Moon", "WildRain") with no user action. Note two instances on one track would both report the same name, so it is a default, not an identity. |
+| 2 | Does Bitwig attach a file path via VST3 `IStreamAttributes` on state load? | If yes, config can be scoped per project (`~/.chromatik-macros/<project>.json`) and the multi-tab problem disappears. If no, scope by name instead. |
+| 3 | Are plugin instances live in an **inactive Bitwig tab**? | Only one tab has an active audio engine. If inactive-tab instances are unloaded, the cross-tab config problem is moot. If they are loaded but not processing, their config watcher is still running and will adopt file edits. |
+| 4 | Can an exact value be typed into a parameter in Bitwig's generic panel? | **Already answered: no.** This is why identity is a name in an editor, not a numeric parameter. |
+
+---
+
+## Edge cases, and how to test each
+
+| # | case | expected | status |
+|---|---|---|---|
+| 1 | Copy a track containing the VST into **another project** | Config travels in the state chunk; no file entry needed; instance keeps working | Implied by the moved-file test; **verify explicitly** |
+| 2 | **Two Bitwig tabs** open, one audio engine active, both containing an instance with the same name; edit the config file | Only affects instances that are loaded. Depends on capability test 3 | **untested** |
+| 3 | Same name used in **two unrelated shows**; edit the file | Both get updated — accepted risk. Mitigate by naming after the Chromatik bank | **untested** |
+| 4 | **Duplicate a track within one project** | Two instances, same name, same OSC address → last-packet-wins. Must be detected and logged, never auto-resolved | partially implemented (duplicate-destination detection); **verify** |
+| 5 | Project moved to another machine **without** the config file | Cached state keeps everything working | **verified** |
+| 6 | **Offline bounce / render** | OSC suppressed — a bounce must not disturb a live rig | implemented, **unverified** |
+| 7 | **Device turned off** | Processing and modulation stop; recover on re-enable | **verified** — known limitation, keep devices enabled |
+| 8 | **Silent track while transport runs**, other tracks producing audio | Modulation continues | **untested — highest remaining risk.** Distinct from stopped transport; this is the per-device smart-suspend case and the actual show condition |
+| 9 | **Malformed or invalid config file** | Keep last valid mapping, report in `~/.chromatik-macros/plugin.log` | implemented, **unverified** |
+| 10 | Two instances configured to the **same OSC destination** | Detect, log, suppress until resolved | implemented, **unverified** |
+| 11 | **Reset-on-load**: save mid-timeline with macros at non-zero, reopen | Macros return to their configured initial value (default 0), not the saved position | **not implemented** |
+
+---
+
+## Blocking-test results
+
+The controller extension this replaces subscribes to `RemoteControl.modulatedValue()`,
+which the host pushes independently of audio processing. A VST3 plugin only receives
+parameter changes during `processBlock()` — so if Bitwig suspends or sleeps the
+device, modulation could stop reaching it. This was the go/no-go question.
 
 | condition | modulation still arriving? |
 |---|---|
-| transport stopped | ? |
-| track silent (no audio) | ? |
-| track muted | ? |
-| device bypassed | ? |
-| device deactivated / suspended | ? |
-| plugin editor closed (there is no editor) | ? |
-| offline bounce / render | should NOT send — see below |
+| transport stopped | **yes** |
+| track muted | **yes** |
+| track silent while other tracks play | **not tested** — see edge case 8 |
+| device turned off | **no**; recovers when re-enabled |
+| device deactivated / suspended | expected no; keep the device enabled |
+| plugin editor closed | not applicable in the prototype; re-check once an editor exists |
+| offline bounce / render | suppression implemented; unverified |
 
-Log to `~/.chromatik-macros/probe.log`.
+Second blocking test — **does an externally-driven state change mark the project
+dirty?** The plugin calls VST3 non-parameter-state notification when a resolved file
+mapping changes, and Bitwig marks a previously saved project modified. **Verified.**
 
-Second, smaller blocking test: **does an externally-driven state change mark the
-Bitwig project dirty?** If MCP reconfigures an instance and Bitwig doesn't know its
-state changed, the config silently fails to persist.
+### Prototype validation log — 2026-08-02
+
+Setup: ChromatikMacro on Slot 1, transport stopped. A Bitwig LFO modulated `macro1`;
+`macro2` and `macro3` held static. `mappings.json` targeted a temporary UDP receiver
+at `127.0.0.1:39031`, not the live Chromatik port. Macros 1–3 enabled at
+`/chromatik-macro/test`.
+
+- Initial snapshot contained `macro1=0`, `macro2=0.405`, `macro3=0.520`; the latter
+  two matched Bitwig's generic parameter controls.
+- `macro1` produced changing OSC float packets at ~40–50Hz while transport was
+  stopped and while the track was muted.
+- A periodic full snapshot of all three enabled macros arrived five seconds later.
+- Turning the plugin off stopped `processBlock()` and froze the modulated value;
+  turning it back on restored modulation immediately.
+- Editing the file live changed the prefix from `/chromatik-macro/test` to
+  `/chromatik-macro/reloaded` without restarting Bitwig, and caused an immediate
+  snapshot on the new addresses.
+- Changing `macro1` scale from `[0,1]` to `[-1,1]` immediately produced the expected
+  bipolar values.
+- Changing only the mapping `name` marked a previously saved project modified;
+  repeated after saving again, passed both times.
+- After saving and closing Bitwig, `mappings.json` was moved aside. Reopening the
+  project restored the cached prefix, bipolar scale, macro values, continuous LFO
+  stream and periodic snapshots without the file. The file was then restored.
+
+The temporary mapping at `~/.chromatik-macros/mappings.json` still points to port
+39031 and is harmless when no test receiver is running. Replace it with production
+mappings before testing against Chromatik on port 3030.
 
 ---
 
-## Design (v1)
+## Design
 
-**No editor.** `hasEditor()` returns false; Bitwig renders its generic parameter
-panel. Modulation routing works against that, so nothing is lost. All configuration
-is JSON + MCP.
+**Parameters:** 8 macro floats, modulatable. Identity is a **name** stored in the
+state chunk and edited in the plugin's editor — not a parameter.
 
-**Parameters:**
-
-```
-"Slot"    integer 1..64, NON-AUTOMATABLE   <- identity
-"macro1".."macro8"  float 0..1             <- the values that get sent
-```
-
-**Why a Slot parameter:** VST3 gives a plugin no way to read its own Bitwig device
-name — there is no API for "what did the user rename this device to", and JUCE does
-not expose one. So the instance cannot know it is "MoonOut". Making identity an
-explicit integer parameter solves it with no UI and no networking: the user sets
-`Slot = 7` in Bitwig's generic panel, and the plugin loads slot 7 from the JSON.
-Duplicating a track produces two instances on slot 7 — a *visible* collision fixed
-by bumping one, rather than an invisible UUID clash.
-
-Mark it non-automatable so it can't be accidentally modulated.
-
-**Config file** — `~/.chromatik-macros/mappings.json`, watched for changes:
+**Config file** — `~/.chromatik-macros/mappings.json`, watched:
 
 ```json
 {
-  "7":  { "name": "MoonOut",
-          "prefix": "/lx/mixer/channel/NightChorus/modulation/Moon",
-          "target": { "host": "127.0.0.1", "port": 3030 },
-          "macros": { "1": {"scale": [0,1]}, "2": {"scale": [0,1]} } },
-  "12": { "name": "LevelsOutA",
-          "prefix": "/lx/mixer/channel/Rain/modulation/LevelsA",
-          "macros": { "1": {"scale": [0,1]} } }
+  "MoonOut":    { "prefix": "/lx/mixer/channel/NightChorus/modulation/Moon",
+                  "target": { "host": "127.0.0.1", "port": 3030 },
+                  "macros": { "1": {"scale": [0,1], "initial": 0},
+                              "2": {"scale": [0,1], "initial": 0} } },
+  "LevelsOutA": { "prefix": "/lx/mixer/channel/Rain/modulation/LevelsA",
+                  "macros": { "1": {"scale": [0,1]} } }
 }
 ```
 
-OSC address for macro N = `<prefix>/macro<N>`. Values sent as normalized 0–1 floats,
-which is what LX expects for ranged parameters.
+OSC address for macro N is `<prefix>/macro<N>`, sent as normalized floats, which is
+what LX expects for ranged parameters. `target` defaults to `127.0.0.1:3030`, `scale`
+defaults to `[0,1]`, `initial` defaults to `0`. Only macros present in the mapping
+emit OSC. Invalid edits retain the last valid mapping and are reported in
+`~/.chromatik-macros/plugin.log`.
 
-**No hub, no WebSocket, no daemon, no port to bind.** The plugin watches a file; MCP
-writes that file. This deliberately rejects the hub/registry design — see "Codex
-review" below for what that avoids.
+*(The current prototype keys this file by slot number; switching the key to name is
+part of remaining v1 work.)*
 
-**Also cache resolved config in the plugin state chunk**, so a project that moves to
-another machine without the JSON keeps working. The file is the editing surface; the
-state chunk is the fallback.
+### Runtime behavior
+
+- A dedicated worker performs all file and UDP work; the audio callback only reads
+  host state and passes audio through.
+- Values coalesced and sent at no more than 50Hz with epsilon suppression.
+- Full snapshots after mapping/connect changes and every five seconds.
+- Offline processing suppresses OSC.
+- Duplicate destinations within the process are suppressed and logged.
 
 ---
 
@@ -127,17 +278,18 @@ state chunk is the fallback.
 - **Fix the parameter count at build time.** Hosts cache VST3 parameter schemas;
   never add/remove macros dynamically. Keep parameter IDs stable forever.
 - **Do nothing in the constructor.** Hosts instantiate plugins during scanning —
-  no file reads, no threads, no sockets until after state restoration and
-  activation.
-- **Detect duplicate OSC destinations.** Two instances driving the same address is
+  no file reads, no threads, no sockets until after state restoration and activation.
+- **Detect duplicate OSC destinations.** Two instances driving one address is
   last-packet-wins and looks like random jitter.
+- **Log the resolved config source on load** — "from state" or "from file entry".
+  When something behaves oddly after a track copy, this shows immediately which won.
 
 ---
 
 ## Migration from OSCpar
 
-The initial `mappings.json` can be **generated**, not hand-written. OSCpar stores
-its full config as plaintext XML inside a ZIP appended to the `.bwproject` file:
+The initial `mappings.json` can be **generated**, not hand-written. OSCpar stores its
+full config as plaintext XML inside a ZIP appended to the `.bwproject` file:
 
 ```xml
 <Preset Prefix="lx/mixer/channel/Sunrise/modulation/LevelsA"
@@ -146,65 +298,107 @@ its full config as plaintext XML inside a ZIP appended to the `.bwproject` file:
 </Preset>
 ```
 
-There are 25 such instances in the current show project. A working extractor
-already exists — see the `bitwig-project` skill at
-`~/Source/bitwig-osc-bridge/.agents/skills/bitwig-project/` (`scripts/bwproject.py presets <file>`).
-That skill also documents the `.bwproject` format and its parsing traps.
+25 such instances exist in the current show. A working extractor already exists — see
+the `bitwig-project` skill at `~/Source/bitwig-osc-bridge/.agents/skills/bitwig-project/`
+(`scripts/bwproject.py presets <file>`), which also documents the `.bwproject` format
+and its parsing traps.
 
 Current show project:
 `/Users/danoved/Dropbox/Projects/Apotheneum-DanO/Bitwig Project/Apotheneum/TreetopTransmission-Burn26.bwproject`
+
+### How much of the switchover can be scripted?
+
+Honest split — the addressing config can be generated, the device swap cannot.
+
+| step | scriptable? |
+|---|---|
+| Back up the project | yes — the `.bwproject` is a single file, just copy it |
+| Extract all 25 OSCpar prefixes, ports and per-macro scaling | **yes** — already working (`bwproject.py presets`) |
+| Generate `mappings.json` from that | **yes** |
+| Replace the OSCpar device with the new plugin in the project file | **no — do not attempt.** Swapping the device means rewriting the VST3 class ID, plugin name, vendor and file path, all length-prefixed strings of different lengths, inside a binary container whose size/offset fields are not understood. One wrong byte and the project will not open. |
+| Re-assign each Bitwig modulator to the new device's parameters | **no** — manual |
+
+So the realistic cost is the modulation re-assignments: 25 instances with up to 8
+modulators each, worst case ~100 drag operations. The *addressing* — prefixes,
+scaling, which macros are live — comes across automatically, which is the part that
+was tedious and error-prone to redo by hand.
+
+Practical approach:
+
+1. Copy the project as a backup.
+2. Generate `mappings.json` from the existing OSCpar states.
+3. Migrate **one track at a time**. Both plugins can coexist — different class IDs,
+   no conflict — so there is no flag day.
+4. While a track is mid-migration, make sure only one of the two is sending to a
+   given OSC address. Two senders on one address is last-packet-wins and looks like
+   random jitter rather than an obvious failure.
+5. Delete the OSCpar instance once its replacement is verified.
+
+The one route that avoids the manual re-assignment entirely is class-ID
+impersonation, below — but it conflicts with shipping this as a general-purpose
+plugin.
+
+### OSCpar class-ID compatibility option
+
+A private-rig migration could build the replacement using OSCpar's VST3 class ID and
+an exactly matching parameter layout. If Bitwig resolves the existing devices to it,
+all current modulation routing survives with no project edits at all. Verify first
+that Bitwig's `PID8eaca05`–`PID8eaca0c` parameter derivation matches the replacement
+schema.
+
+Not the default strategy: reusing another vendor's UID is class-ID squatting, breaks
+if OSCpar is also installed, and is acceptable only as a controlled private technique.
 
 ---
 
 ## Codex review — what it flagged
 
-Codex reviewed this design. Points worth keeping:
+- **Agreed a plugin can replace the controller extension** for this use case. Only a
+  controller extension can see whole-project track/device structure, the Bitwig
+  selection, probe cursors, and arbitrary remote controls / Grid outputs — none of
+  which matter if we only care about values routed into the plugin's own parameters.
+  Transport is not a loss; the extension never streamed it.
+- **Plugin state should be authoritative**, for portability and preset-copy sanity.
+  Adopted — see config semantics.
+- **The suspension risk** was called the most significant behavioural regression, and
+  is why the blocking test came first. Mostly cleared; edge case 8 remains.
+- **The project-dirty problem** on externally-driven state changes. Verified working.
+- Recommended a narrow proof of concept with commitment contingent on those tests.
+  That is what happened.
 
-- **Agreed the plugin can replace the extension** for this use case. What is only
-  available to a controller extension: whole-project track/device discovery, the
-  Bitwig selection and probe mechanism, and arbitrary remote controls / Grid
-  outputs. None of that is needed if we only care about values routed *into* the
-  plugin's own parameters. Transport is not a loss — the extension never streamed it.
-- **Argued plugin state should be authoritative**, with any hub as a discovery
-  layer only, for portability and preset-copy sanity. The JSON-file design honours
-  this via the state-chunk fallback.
-- **Warned hard about the suspension risk** above — it called this the most
-  significant behavioural regression, and it is the reason for the blocking test.
-- **Warned about the project-dirty problem** on externally-driven state changes.
-- Recommended a narrow 8-parameter proof of concept with retirement contingent on
-  those two tests passing. That is exactly the plan.
-
-The hub/registry design was considered and rejected: it required reconnect logic,
-startup-ordering handling, port-conflict ownership, and an `instanceId` collision
-scheme. A watched JSON file plus a Slot parameter removes all of it.
+A hub/registry daemon was considered and rejected: reconnect logic, startup ordering,
+port ownership and instance-ID collisions, all to solve what a watched file solves.
 
 ---
 
 ## Toolchain
 
-- `cmake` 4.4.2 — installed via Homebrew
-- Apple clang 17, Command Line Tools at `/Library/Developer/CommandLineTools`
-- JUCE 8.0.4 pulled by `FetchContent` (shallow) — first configure will take a while
-- `CMakeLists.txt` is written: VST3 only, `COPY_PLUGIN_AFTER_BUILD TRUE`, links
+- `cmake` 4.4.2 (Homebrew), Apple clang 17, Command Line Tools
+- JUCE 8.0.4 via `FetchContent` (shallow) — first configure takes a while
+- `CMakeLists.txt`: VST3 only, `COPY_PLUGIN_AFTER_BUILD TRUE`, links
   `juce_audio_utils` and `juce_osc`
 
 ```sh
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
+ctest --test-dir build --output-on-failure   # mapping parser tests
 ```
 
 Built plugin lands in `~/Library/Audio/Plug-Ins/VST3/`.
 
-Only `src/PluginProcessor.cpp` is referenced by `CMakeLists.txt` and it does not
-exist yet — that is the first file to write.
-
 ---
 
-## Related
+## Related, and one live hazard
 
-- `~/Source/bitwig-osc-bridge` — the controller extension this would retire. It
-  currently holds ~48 working bindings for the Burn26 show; do not break it until
-  the plugin is proven.
+- `~/Source/bitwig-osc-bridge` — a Bitwig controller extension doing the same job a
+  different way. **Hazard: it currently holds ~48 bindings pointing at many of the
+  same Chromatik macros that OSCpar devices in the show project also drive.** Two
+  senders on one address is last-packet-wins and looks like random jitter. Clear its
+  slots before running the show, or before testing this plugin against port 3030.
+- `docs/linking-design.md` is **out of date** — it documents learn-by-demonstration,
+  an announce packet, UUIDs and slot numbers, all discarded. The v2 notes above
+  supersede it.
 - Chromatik OSC receive: `127.0.0.1:3030`.
-- Channel names work in OSC addresses (`/lx/mixer/channel/Sunrise/...`), verified
-  live — they don't have to be numeric indices.
+- Channel names work in OSC addresses (`/lx/mixer/channel/Sunrise/...`) — verified
+  live; they do not have to be numeric indices.
+- LX source for reference: `~/Source/lx`
