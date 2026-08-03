@@ -246,14 +246,48 @@ That UUID is the config key. A separate `name` field carries the human label:
   the name and prefix on an entry that already exists.
 - **Travels with a copied track**, since it lives in the state chunk.
 
-**Duplication caveat:** duplicating a Bitwig track copies the state chunk verbatim,
-UUID included, so two instances share one config entry and one OSC address —
-last-packet-wins, which looks like jitter rather than a failure. Detect this
-(two instances with the same UUID in-process) and **report it; never auto-rekey.**
-Bitwig runs multiple tabs in one process, so two legitimately separate projects
-containing a copied track are indistinguishable from a duplicate, and auto-rekeying
-would silently mutate one of them. The editor's "regenerate ID" button is how a human
-resolves it.
+### Duplicating a track
+
+**Duplication copies the UUID.** The host copies the state chunk verbatim, and the
+plugin cannot tell the difference — a duplicate and an ordinary project load both
+arrive as `setStateInformation` with identical bytes. There is no VST3 signal for
+"you were just cloned".
+
+Note this is **not a regression**: duplicating a track with OSCpar today produces two
+devices sending to the same OSC path, silently. The improvement available here is
+making it loud.
+
+**Detection.** Keep a process-wide static registry of live UUIDs. On state restore,
+if another live instance already claims yours, you are a duplicate. Reliable within a
+process, costs nothing.
+
+**Behaviour on detection** — the second instance to claim a UUID should:
+
+1. mark itself duplicate
+2. **stop sending** until resolved
+3. show a warning in its editor with a "regenerate ID" button
+
+Stopping matters. Two instances on one address produce jittering values that look
+like a Chromatik fault or a flaky LFO and are genuinely hard to diagnose. One silent
+instance with a visible warning is a five-second fix.
+
+**On regenerate, clone the config entry** under the new UUID rather than starting
+blank — a duplicated track usually wants the same prefix and scaling, just re-pointed.
+
+**Whether this can be automatic depends on host-capability test 2.** Bitwig runs
+multiple tabs in one process, so two legitimately separate projects each containing a
+copied track collide identically to a real duplicate:
+
+| same UUID, ... | verdict |
+|---|---|
+| same project path | genuine duplicate — safe to auto-resolve |
+| different project path | two tabs of different projects — leave alone |
+
+If `IStreamAttributes` supplies a project path, that distinction is available and
+duplicates can be resolved automatically. **Without it, report only — never
+auto-rekey**, since doing so would silently mutate a legitimate instance. The
+cross-tab false positive is mostly harmless in practice because only one tab has an
+active audio engine, but that relies on capability test 3.
 
 **Config file** — `~/.chromatik-macros/mappings.json`, watched:
 
