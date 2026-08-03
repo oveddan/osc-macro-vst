@@ -1,6 +1,6 @@
 # Draft feature request for Chromatik / LX
 
-**Not filed yet.**
+**Filed:** https://github.com/heronarts/LX/issues/157
 
 ---
 

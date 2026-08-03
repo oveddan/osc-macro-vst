@@ -59,6 +59,8 @@ int main()
             "resolved cache parses");
     expect (cached.prefix == mapping.prefix, "cached mapping matches source mapping");
     expect (cached.identity == identity, "cached mapping retains supplied identity");
+    expect (chromatik::parseResolvedMapping (resolved, {}, cached).failed(),
+            "cached mapping requires an identity");
 
     chromatik::Mapping missing;
     juce::String ignored;
@@ -70,6 +72,9 @@ int main()
     const auto invalidScale = validJson.replace ("[-1, 1]", "[0]");
     expect (chromatik::parseMappingsFile (invalidScale, identity, missing, ignored).failed(),
             "invalid scale fails");
+    const auto nonNumericScale = validJson.replace ("[-1, 1]", "[\"low\", 1]");
+    expect (chromatik::parseMappingsFile (nonNumericScale, identity, missing, ignored).failed(),
+            "non-numeric scale fails");
 
     const juce::String defaultsJson = R"json(
         { "defaults": { "prefix": "/test", "macros": { "1": {} } } })json";
@@ -91,6 +96,10 @@ int main()
     const auto malformedInitial = validJson.replace ("\"initial\": 0.25", "\"initial\": \"zero\"");
     expect (chromatik::parseMappingsFile (malformedInitial, identity, missing, ignored).failed(),
             "non-numeric initial fails");
+
+    const auto outOfRangeInitial = validJson.replace ("\"initial\": 0.25", "\"initial\": 1.1");
+    expect (chromatik::parseMappingsFile (outOfRangeInitial, identity, missing, ignored).failed(),
+            "out-of-range initial fails");
 
     const auto malformedBoolean = validJson.replace ("\"resetOnLoad\": false", "\"resetOnLoad\": 0");
     expect (chromatik::parseMappingsFile (malformedBoolean, identity, missing, ignored).failed(),

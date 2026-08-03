@@ -103,12 +103,12 @@ juce::Result parseMappingObject (const juce::var& value,
                 || std::floor (configuredPort) != configuredPort)
                 return juce::Result::fail ("Target port must be an integer");
 
+            if (configuredPort < 1.0 || configuredPort > 65535.0)
+                return juce::Result::fail ("Target port must be between 1 and 65535");
+
             candidate.port = static_cast<int> (configuredPort);
         }
     }
-
-    if (candidate.port < 1 || candidate.port > 65535)
-        return juce::Result::fail ("Target port must be between 1 and 65535");
 
     if (object->hasProperty ("macros"))
     {
@@ -159,6 +159,9 @@ juce::Result parseMappingObject (const juce::var& value,
                                                            macro.initial);
                     result.failed())
                     return result;
+
+            if (macro.initial < 0.0f || macro.initial > 1.0f)
+                return juce::Result::fail ("Macro initial value must be between 0 and 1");
 
             if (route->hasProperty ("resetOnLoad"))
             {
