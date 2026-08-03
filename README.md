@@ -62,15 +62,13 @@ Remaining:
 
 - **Reset-on-load defaults** — per-macro initial value, default 0, with an opt-out
   for macros that are hand-set rather than modulated. This is the stale-knob fix.
-- **Minimal editor** — a name field plus a status line (OSC target, sending or not).
-  Required because VST3 parameters cannot be strings, and Bitwig's generic parameter
-  panel does not allow typing an exact value, so identity cannot be a numeric
-  parameter.
-- **Identity = name, not slot number.** Decided: a name reads better, avoids the
-  can't-type-exact-values problem, and collides across projects only when it
-  genuinely means the same thing (every project has a slot 7; only related projects
-  have a `MoonOut`). Change this before the editor is written — it is awkward once
-  projects have slot numbers baked in.
+- **Minimal editor** — a name field, a status line (OSC target, sending or not), and
+  a "regenerate ID" button for resolving duplicates. Required because VST3 parameters
+  cannot be strings, and Bitwig's generic parameter panel does not allow typing an
+  exact value, so nothing human-editable can be a parameter.
+- **Identity = a self-generated UUID, with a human name as a separate field.**
+  Decided — see "Identity" below. Change this before the editor is written; the
+  prototype currently keys config by slot number.
 - Host-capability and edge-case tests below.
 
 ### Config semantics — important
@@ -164,8 +162,8 @@ with the probe plugin and read the log.
 |---|---|---|---|
 | 1 | Copy a track containing the VST into **another project** | Config travels in the state chunk; no file entry needed; instance keeps working | Implied by the moved-file test; **verify explicitly** |
 | 2 | **Two Bitwig tabs** open, one audio engine active, both containing an instance with the same name; edit the config file | Only affects instances that are loaded. Depends on capability test 3 | **untested** |
-| 3 | Same name used in **two unrelated shows**; edit the file | Both get updated — accepted risk. Mitigate by naming after the Chromatik bank | **untested** |
-| 4 | **Duplicate a track within one project** | Two instances, same name, same OSC address → last-packet-wins. Must be detected and logged, never auto-resolved | partially implemented (duplicate-destination detection); **verify** |
+| 3 | Same UUID present in **two unrelated projects** (a track copied between them); edit the file | Both get updated — they share one config entry. Regenerate the ID on one if they should diverge | **untested** |
+| 4 | **Duplicate a track within one project** | Two instances share a UUID → one config entry, one OSC address → last-packet-wins. Must be detected and reported, never auto-rekeyed | partially implemented (duplicate-destination detection); **verify** |
 | 5 | Project moved to another machine **without** the config file | Cached state keeps everything working | **verified** |
 | 6 | **Offline bounce / render** | OSC suppressed — a bounce must not disturb a live rig | implemented, **unverified** |
 | 7 | **Device turned off** | Processing and modulation stop; recover on re-enable | **verified** — known limitation, keep devices enabled |
@@ -230,30 +228,62 @@ mappings before testing against Chromatik on port 3030.
 
 ## Design
 
-**Parameters:** 8 macro floats, modulatable. Identity is a **name** stored in the
-state chunk and edited in the plugin's editor — not a parameter.
+**Parameters:** 8 macro floats, modulatable. Nothing else is a parameter.
+
+### Identity
+
+VST3 provides no per-instance identifier — the class ID is shared by every instance
+of a plugin. So the plugin **generates its own UUID on first instantiation** and
+persists it in the state chunk.
+
+That UUID is the config key. A separate `name` field carries the human label:
+
+- **Rename-safe** — the name is display-only, so changing it breaks nothing. Keying
+  by name would break the link on every rename, which is the same location-not-identity
+  trap that path-based addressing has.
+- **Self-registering** — on first run the plugin writes its own entry with an empty
+  prefix and `"(unnamed)"`. The UUID is never typed or copied by a human; you fill in
+  the name and prefix on an entry that already exists.
+- **Travels with a copied track**, since it lives in the state chunk.
+
+**Duplication caveat:** duplicating a Bitwig track copies the state chunk verbatim,
+UUID included, so two instances share one config entry and one OSC address —
+last-packet-wins, which looks like jitter rather than a failure. Detect this
+(two instances with the same UUID in-process) and **report it; never auto-rekey.**
+Bitwig runs multiple tabs in one process, so two legitimately separate projects
+containing a copied track are indistinguishable from a duplicate, and auto-rekeying
+would silently mutate one of them. The editor's "regenerate ID" button is how a human
+resolves it.
 
 **Config file** — `~/.chromatik-macros/mappings.json`, watched:
 
 ```json
 {
-  "MoonOut":    { "prefix": "/lx/mixer/channel/NightChorus/modulation/Moon",
-                  "target": { "host": "127.0.0.1", "port": 3030 },
-                  "macros": { "1": {"scale": [0,1], "initial": 0},
-                              "2": {"scale": [0,1], "initial": 0} } },
-  "LevelsOutA": { "prefix": "/lx/mixer/channel/Rain/modulation/LevelsA",
-                  "macros": { "1": {"scale": [0,1]} } }
+  "a3f2c19d": { "name": "MoonOut",
+                "prefix": "/lx/mixer/channel/NightChorus/modulation/Moon",
+                "target": { "host": "127.0.0.1", "port": 3030 },
+                "macros": { "1": {"scale": [0,1], "initial": 0},
+                            "2": {"scale": [0,1], "initial": 0} } },
+  "77bd4e02": { "name": "LevelsOutA",
+                "prefix": "/lx/mixer/channel/Rain/modulation/LevelsA",
+                "macros": { "1": {"scale": [0,1]} } },
+  "c410a8f6": { "name": "(unnamed)",
+                "prefix": "" }
 }
 ```
 
 OSC address for macro N is `<prefix>/macro<N>`, sent as normalized floats, which is
 what LX expects for ranged parameters. `target` defaults to `127.0.0.1:3030`, `scale`
-defaults to `[0,1]`, `initial` defaults to `0`. Only macros present in the mapping
-emit OSC. Invalid edits retain the last valid mapping and are reported in
+defaults to `[0,1]`, `initial` defaults to `0`. An empty `prefix` means the instance
+is unconfigured and emits nothing. Only macros present in the mapping emit OSC.
+Invalid edits retain the last valid mapping and are reported in
 `~/.chromatik-macros/plugin.log`.
 
-*(The current prototype keys this file by slot number; switching the key to name is
-part of remaining v1 work.)*
+Editing by hand or by agent works by locating the entry via its `name` field, so the
+UUIDs stay out of the way.
+
+*(The current prototype keys this file by slot number; switching to UUID keys with a
+name field is part of remaining v1 work.)*
 
 ### Runtime behavior
 
