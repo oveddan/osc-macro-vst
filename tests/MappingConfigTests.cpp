@@ -15,6 +15,12 @@ void expect (bool condition, const char* message)
         ++failures;
     }
 }
+
+bool isObjectJson (const juce::String& json)
+{
+    juce::var value;
+    return juce::JSON::parse (json, value).wasOk() && value.getDynamicObject() != nullptr;
+}
 }
 
 int main()
@@ -69,6 +75,11 @@ int main()
     expect (chromatik::parseMappingsFile (validJson, {}, missing, ignored).failed(),
             "missing identity argument fails");
 
+    const auto unrelatedMalformed = validJson.replace (
+        "}\n        }", "},\n          \"broken-instance\": 1\n        }");
+    expect (chromatik::parseMappingsFile (unrelatedMalformed, identity, mapping, resolved).wasOk(),
+            "a malformed unrelated entry does not disable a valid identity");
+
     const auto invalidScale = validJson.replace ("[-1, 1]", "[0]");
     expect (chromatik::parseMappingsFile (invalidScale, identity, missing, ignored).failed(),
             "invalid scale fails");
@@ -104,6 +115,63 @@ int main()
     const auto malformedBoolean = validJson.replace ("\"resetOnLoad\": false", "\"resetOnLoad\": 0");
     expect (chromatik::parseMappingsFile (malformedBoolean, identity, missing, ignored).failed(),
             "non-boolean reset-on-load fails");
+
+    const juce::String existingJson = R"json(
+        {
+          "a3f2c19d": {
+            "name": "Before",
+            "prefix": "/existing",
+            "target": { "host": "10.0.0.4", "port": 4000 },
+            "macros": { "1": { "scale": [-1, 1], "initial": 0.4, "resetOnLoad": false } }
+          },
+          "other-instance": { "name": "Other", "prefix": "/other", "macros": { "2": {} } }
+        })json";
+    juce::String upserted;
+    expect (chromatik::upsertMappingName (existingJson, identity, "After", "{}", upserted).wasOk(),
+            "existing entry name upsert succeeds");
+    expect (chromatik::parseMappingsFile (upserted, identity, mapping, resolved).wasOk(),
+            "upserted existing entry remains parseable");
+    expect (mapping.name == "After" && mapping.prefix == "/existing",
+            "existing entry changes only its name");
+    expect (mapping.host == "10.0.0.4" && mapping.port == 4000
+            && ! mapping.macros[0].resetOnLoad
+            && std::abs (mapping.macros[0].initial - 0.4f) < 0.0001f,
+            "existing route fields are preserved");
+    expect (chromatik::parseMappingsFile (upserted, "other-instance", mapping, resolved).wasOk()
+            && mapping.name == "Other" && mapping.prefix == "/other",
+            "unrelated entries are preserved");
+
+    const juce::String fallback = R"json(
+        { "name": "Cached", "prefix": "/cached", "macros": { "3": { "initial": 0.6 } } })json";
+    expect (chromatik::upsertMappingName ("{}", "from-cache", "Restored", fallback, upserted).wasOk(),
+            "missing entry inserts valid fallback");
+    expect (chromatik::parseMappingsFile (upserted, "from-cache", mapping, resolved).wasOk()
+            && mapping.name == "Restored" && mapping.prefix == "/cached"
+            && mapping.macros[2].enabled
+            && std::abs (mapping.macros[2].initial - 0.6f) < 0.0001f,
+            "fallback fields survive registration while its name is updated");
+
+    expect (chromatik::upsertMappingName (juce::String(), "fresh", "(unnamed)",
+                                          juce::String(), upserted).wasOk(),
+            "empty file creates a fresh unconfigured entry");
+    expect (chromatik::parseMappingsFile (upserted, "fresh", mapping, resolved).wasOk()
+            && mapping.name == "(unnamed)" && mapping.prefix.isEmpty()
+            && ! mapping.macros[0].enabled,
+            "fresh entry has an empty prefix and no routes");
+
+    expect (chromatik::upsertMappingName ("[]", "fresh", "Name", juce::String(), upserted).failed(),
+            "non-object root is rejected");
+    expect (chromatik::upsertMappingName (R"json({ "fresh": 1 })json", "fresh", "Name",
+                                          juce::String(), upserted).failed(),
+            "malformed entry is rejected");
+    expect (chromatik::upsertMappingName ("{}", "fresh", "Name", "[]", upserted).failed(),
+            "non-object fallback is rejected");
+    expect (chromatik::upsertMappingName ("{}", "fresh", "Name",
+                                          R"json({ "prefix": "/bad", "macros": { "1": { "initial": "bad" } } })json",
+                                          upserted).failed(),
+            "malformed fallback route is rejected");
+
+    expect (isObjectJson (upserted), "upsert returns complete JSON");
 
     if (failures == 0)
         std::cout << "All mapping config tests passed\n";

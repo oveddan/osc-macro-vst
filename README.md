@@ -11,10 +11,11 @@ host. Chromatik/LX is simply the receiver it is being built for first, and Bitwi
 host it is being tested in. See "Naming and portability" — the product name needs
 deciding *before* any show projects are built on it.
 
-**Status: v1 prototype built and largely validated.** File-backed mappings, cached
-state, rate-limited OSC, hot reload and project-dirty notification all work and are
-tested (see validation log). Remaining v1 work: reset-on-load defaults, a minimal
-editor, and the host-capability and edge-case tests listed below.
+**Status: v1 implementation complete; final host validation remains.** File-backed
+mappings, UUID identity, cached state, rate-limited OSC, hot reload, reset-on-load,
+the minimal editor and project-dirty notification are implemented. The earlier
+prototype behavior and reset-on-load are validated below; the new editor still needs
+its explicit Bitwig test before this should be used against the live port.
 
 **Scope note:** this is now scoped as an *OSCpar replacement*, not the larger
 Bitwig↔Chromatik linking redesign. Prefix-based addressing stays. The Chromatik-side
@@ -58,29 +59,33 @@ Already built and validated:
 - Cached config in the plugin state chunk
 - Project-dirty notification on external config change
 
-Remaining:
+Now implemented, awaiting host validation:
 
-- **Reset-on-load defaults** — per-macro initial value, default 0, with an opt-out
-  for macros that are hand-set rather than modulated. This is the stale-knob fix.
-- **Minimal editor** — a name field and a status line (OSC target, sending or not).
-  Required because VST3 parameters cannot be strings, and Bitwig's generic parameter
-  panel does not allow typing an exact value, so nothing human-editable can be a
-  parameter.
+- **Reset-on-load defaults** — per-macro `initial`, default 0. Set
+  `"resetOnLoad": false` on a macro that should retain its saved hand-set value.
+  Reset is queued once per project-state restoration, after resolving the current
+  file entry first and cached state as fallback; config hot reload never resets a
+  running macro.
+- **Minimal editor** — an editable name field and a status line showing the OSC
+  target and `sending`, `unconfigured`, `collision`, `error`, `offline` or
+  `inactive`. Required because VST3 parameters cannot be strings, and Bitwig's
+  generic parameter panel does not allow typing an exact value.
 - **Identity = a self-generated UUID, with a human name as a separate field.**
-  Decided — see "Identity" below. Change this before the editor is written; the
-  prototype currently keys config by slot number.
+  Implemented — see "Identity" below.
 - Host-capability and edge-case tests below.
 
 ### Config semantics — important
 
-Three rules, two of which are already implemented and verified:
+Three rules define the behavior:
 
 1. **Plugin state is authoritative.** Config travels inside the plugin, so a track
    copied to another project carries its configuration with it. *(verified)*
 2. **A missing file entry means "keep what you have"**, never "clear". *(verified —
    the moved-file test)*
-3. **The config file only ever pushes.** It is a bulk-edit surface for whatever
-   project is currently open, not a database of all instances.
+3. **Routing config only pushes.** The plugin writes only the narrow registration
+   surface (UUID plus name); prefix, target and macro routes flow from the file into
+   plugin state. The file is a bulk editor for loaded instances, not the authority
+   for whether a saved instance keeps working.
 
 Framing the file as a *bulk editor rather than a database* resolves most of the
 multi-project edge cases below.
@@ -168,16 +173,16 @@ with the probe plugin and read the log.
 | # | case | expected | status |
 |---|---|---|---|
 | 1 | Copy a track containing the VST into **another project** | Config travels in the state chunk; no file entry needed; instance keeps working | Implied by the moved-file test; **verify explicitly** |
-| 2 | **Two Bitwig tabs** open, one audio engine active, both containing an instance with the same name; edit the config file | Only affects instances that are loaded. Depends on capability test 3 | **untested** |
+| 2 | **Two Bitwig tabs** open, one audio engine active, both containing an instance with the same name; edit the config file | Both loaded instances may adopt the edit, but only an instance receiving recent process callbacks may own and send to the destination | **implemented, untested** |
 | 3 | Same UUID present in **two unrelated projects** (a track copied between them); edit the file | Both get updated — they share one config entry | **untested**; related to the deferred duplication limitation |
-| 4 | **Duplicate a track within one project** | Two instances share a UUID → one config entry, one OSC address → last-packet-wins | **known limitation, deferred** — see "Duplicating a track". Workaround: re-point the copy by hand |
+| 4 | **Duplicate a track within one project** | Two instances share a UUID and one config entry; the active destination registry lets one send and reports a collision on the other | **known limitation, deferred** — see "Duplicating a track" |
 | 5 | Project moved to another machine **without** the config file | Cached state keeps everything working | **verified** |
 | 6 | **Offline bounce / render** | OSC suppressed — a bounce must not disturb a live rig | implemented, **unverified** |
 | 7 | **Device turned off** | Processing and modulation stop; recover on re-enable | **verified** — known limitation, keep devices enabled |
 | 8 | **Silent track while transport runs**, other tracks producing audio | Modulation continues | **untested — highest remaining risk.** Distinct from stopped transport; this is the per-device smart-suspend case and the actual show condition |
 | 9 | **Malformed or invalid config file** | Keep last valid mapping, report in `~/.chromatik-macros/plugin.log` | implemented, **unverified** |
-| 10 | Two instances configured to the **same OSC destination** | Detect, log, suppress until resolved | implemented, **unverified** |
-| 11 | **Reset-on-load**: save mid-timeline with macros at non-zero, reopen | Macros return to their configured initial value (default 0), not the saved position | **not implemented** |
+| 10 | Two active instances configured to the **same OSC destination** | Detect, log, suppress until resolved; inactive instances relinquish ownership | implemented, **unverified** |
+| 11 | **Reset-on-load**: save mid-timeline with macros at non-zero, reopen | Macros return to their configured initial value (default 0), not the saved position | **verified** — macro2 saved at 0.83 and reopened at 0.0 |
 
 ---
 
@@ -195,12 +200,17 @@ device, modulation could stop reaching it. This was the go/no-go question.
 | track silent while other tracks play | **not tested** — see edge case 8 |
 | device turned off | **no**; recovers when re-enabled |
 | device deactivated / suspended | expected no; keep the device enabled |
-| plugin editor closed | not applicable in the prototype; re-check once an editor exists |
+| plugin editor closed | editor is now implemented; **re-check** |
 | offline bounce / render | suppression implemented; unverified |
 
 Second blocking test — **does an externally-driven state change mark the project
 dirty?** The plugin calls VST3 non-parameter-state notification when a resolved file
 mapping changes, and Bitwig marks a previously saved project modified. **Verified.**
+
+Third blocking test — **does reset-on-load beat Bitwig's saved parameter value?**
+`macro2` was set to `0.83`, the project was saved and Bitwig was closed. After
+reopening `ChromatikMacroTest` without touching the control, its OSC snapshot reported
+`macro2=0.000000`. **Verified.** No stale `0.83` packet was observed after reopening.
 
 ### Prototype validation log — 2026-08-02
 
@@ -256,23 +266,19 @@ That UUID is the config key. A separate `name` field carries the human label:
 ### Duplicating a track — known limitation, deferred
 
 Duplicating a track copies the state chunk verbatim, UUID included, so both instances
-share one config entry and send to the same OSC address. Last-packet-wins, which looks
-like jitter rather than an obvious failure.
+share one config entry and destination. The process-wide destination registry now
+lets one actively processing instance send and reports `collision` on the other,
+preventing last-packet-wins jitter inside one host process.
 
-The plugin cannot detect this on its own: a duplicate and an ordinary project load both
-arrive as `setStateInformation` with identical bytes, and VST3 gives no "you were just
-cloned" signal.
+The unresolved part is identity: changing that shared file entry changes both copies.
+For an independent copy today, remove and reinsert the plugin on the duplicated track
+to mint a new UUID, then reconnect its Bitwig modulation assignments.
 
-**Not a regression** — duplicating a track with OSCpar today produces two devices on
-the same OSC path, equally silently. Logged as a known bug to solve later rather than
-designed around now. Workaround for the moment: after duplicating a track, point the
-copy at a different destination by hand.
-
-Notes for whenever it is picked up: a process-wide registry of live UUIDs would detect
-the collision, but Bitwig runs multiple tabs in one process, so two separate projects
-each containing a copied track look identical to a real duplicate. Host-capability
-test 2 (project path via `IStreamAttributes`) is what would make them distinguishable
-and the fix automatic.
+Automatic re-identification is deferred because a duplicate and an ordinary project
+load both arrive as identical state restoration, and VST3 supplies no "just cloned"
+signal. Project path via `IStreamAttributes` (host-capability test 2) may eventually
+make true within-project duplication distinguishable from a copied track in another
+project. Separate host processes cannot share the in-process collision registry.
 
 **Config file** — `~/.chromatik-macros/mappings.json`, watched:
 
@@ -301,8 +307,10 @@ Invalid edits retain the last valid mapping and are reported in
 Editing by hand or by agent works by locating the entry via its `name` field, so the
 UUIDs stay out of the way.
 
-*(The current prototype keys this file by slot number; switching to UUID keys with a
-name field is part of remaining v1 work.)*
+The key is the instance UUID generated by the plugin. A fresh instance atomically
+self-registers an `(unnamed)` entry with an empty prefix; editing its name in the
+plugin updates only that entry's name and preserves its routes. Deleted instances do
+not currently prune their entries, so remove confirmed orphans by hand when needed.
 
 ### Runtime behavior
 
@@ -312,6 +320,9 @@ name field is part of remaining v1 work.)*
 - Full snapshots after mapping/connect changes and every five seconds.
 - Offline processing suppresses OSC.
 - Duplicate destinations within the process are suppressed and logged.
+- Destination ownership requires a recent process callback. This prevents a loaded
+  but inactive Bitwig tab from permanently winning the process-wide collision
+  registry; ownership is retried when processing resumes.
 
 ---
 
@@ -328,8 +339,9 @@ name field is part of remaining v1 work.)*
   never add/remove macros dynamically. Keep parameter IDs stable forever.
 - **Do nothing in the constructor.** Hosts instantiate plugins during scanning —
   no file reads, no threads, no sockets until after state restoration and activation.
-- **Detect duplicate OSC destinations.** Two instances driving one address is
-  last-packet-wins and looks like random jitter.
+- **Detect duplicate OSC destinations.** Lease each destination to one recently
+  processing instance and suppress colliding instances; otherwise two senders create
+  last-packet-wins jitter.
 - **Log the resolved config source on load** — "from state" or "from file entry".
   When something behaves oddly after a track copy, this shows immediately which won.
 
@@ -337,8 +349,9 @@ name field is part of remaining v1 work.)*
 
 ## Migration from OSCpar
 
-The initial `mappings.json` can be **generated**, not hand-written. OSCpar stores its
-full config as plaintext XML inside a ZIP appended to the `.bwproject` file:
+The routing portion of `mappings.json` can be **generated**, not hand-written, after
+the new UUID entries have self-registered. OSCpar stores its full config as plaintext
+XML inside a ZIP appended to the `.bwproject` file:
 
 ```xml
 <Preset Prefix="lx/mixer/channel/Sunrise/modulation/LevelsA"
@@ -363,7 +376,7 @@ Honest split — the addressing config can be generated, the device swap cannot.
 |---|---|
 | Back up the project | yes — the `.bwproject` is a single file, just copy it |
 | Extract all 25 OSCpar prefixes, ports and per-macro scaling | **yes** — already working (`bwproject.py presets`) |
-| Generate `mappings.json` from that | **yes** |
+| Merge those routes into self-registered UUID entries, matched by human name | **yes, after the replacement instances have registered** |
 | Replace the OSCpar device with the new plugin in the project file | **no — do not attempt.** Swapping the device means rewriting the VST3 class ID, plugin name, vendor and file path, all length-prefixed strings of different lengths, inside a binary container whose size/offset fields are not understood. One wrong byte and the project will not open. |
 | Re-assign each Bitwig modulator to the new device's parameters | **no** — manual |
 
@@ -375,13 +388,16 @@ was tedious and error-prone to redo by hand.
 Practical approach:
 
 1. Copy the project as a backup.
-2. Generate `mappings.json` from the existing OSCpar states.
-3. Migrate **one track at a time**. Both plugins can coexist — different class IDs,
+2. Add the replacement instances. Each creates an opaque UUID entry in
+   `mappings.json`; give each instance a unique name in its editor.
+3. Generate or merge the extracted OSCpar routes into those registered entries by
+   matching the human names. UUIDs cannot be generated ahead of instantiation.
+4. Migrate **one track at a time**. Both plugins can coexist — different class IDs,
    no conflict — so there is no flag day.
-4. While a track is mid-migration, make sure only one of the two is sending to a
+5. While a track is mid-migration, make sure only one of the two is sending to a
    given OSC address. Two senders on one address is last-packet-wins and looks like
    random jitter rather than an obvious failure.
-5. Delete the OSCpar instance once its replacement is verified.
+6. Delete the OSCpar instance once its replacement is verified.
 
 The one route that avoids the manual re-assignment entirely is class-ID
 impersonation, below — but it conflicts with shipping this as a general-purpose

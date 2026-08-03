@@ -39,4 +39,13 @@ juce::Result parseMappingsFile (const juce::String& json,
 juce::Result parseResolvedMapping (const juce::String& json,
                                    const juce::String& identity,
                                    Mapping& mapping);
+
+// Returns a complete mappings-file document after registering or renaming one
+// instance. An empty fallbackResolvedJson creates a fresh, unconfigured entry;
+// a non-empty fallback must be one resolved mapping object from plugin state.
+juce::Result upsertMappingName (const juce::String& currentJson,
+                                const juce::String& identity,
+                                const juce::String& name,
+                                const juce::String& fallbackResolvedJson,
+                                juce::String& updatedJson);
 }

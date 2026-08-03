@@ -1,5 +1,5 @@
 {
-  "1": {
+  "0123456789abcdef0123456789abcdef": {
     "name": "ExampleOut",
     "prefix": "/lx/mixer/channel/Example/modulation/ExampleOut",
     "target": {
@@ -7,8 +7,8 @@
       "port": 3030
     },
     "macros": {
-      "1": { "scale": [0, 1] },
-      "2": { "scale": [0, 1] }
+      "1": { "scale": [0, 1], "initial": 0 },
+      "2": { "scale": [0, 1], "initial": 0, "resetOnLoad": false }
     }
   }
 }

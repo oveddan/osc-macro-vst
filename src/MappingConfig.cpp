@@ -180,6 +180,28 @@ juce::Result parseMappingObject (const juce::var& value,
     mapping = std::move (candidate);
     return juce::Result::ok();
 }
+
+juce::Result validateMappingsRoot (const juce::var& root)
+{
+    const auto* object = root.getDynamicObject();
+
+    if (object == nullptr)
+        return juce::Result::fail ("Mappings file must contain a JSON object");
+
+    for (const auto& property : object->getProperties())
+    {
+        Mapping ignored;
+
+        if (const auto result = parseMappingObject (property.value,
+                                                     property.name.toString(),
+                                                     ignored);
+            result.failed())
+            return juce::Result::fail ("Invalid mapping " + property.name.toString()
+                                       + ": " + result.getErrorMessage());
+    }
+
+    return juce::Result::ok();
+}
 }
 
 juce::String Mapping::addressFor (int macroIndex) const
@@ -237,5 +259,67 @@ juce::Result parseResolvedMapping (const juce::String& json,
         return result;
 
     return parseMappingObject (value, identity, mapping);
+}
+
+juce::Result upsertMappingName (const juce::String& currentJson,
+                                const juce::String& identity,
+                                const juce::String& name,
+                                const juce::String& fallbackResolvedJson,
+                                juce::String& updatedJson)
+{
+    const auto normalizedIdentity = identity.trim();
+
+    if (normalizedIdentity.isEmpty())
+        return juce::Result::fail ("Mapping identity is required");
+
+    juce::var root;
+
+    if (currentJson.trim().isEmpty())
+        root = juce::var (new juce::DynamicObject());
+    else if (const auto result = juce::JSON::parse (currentJson, root); result.failed())
+        return result;
+
+    if (const auto rootResult = validateMappingsRoot (root); rootResult.failed())
+        return rootResult;
+
+    auto* object = root.getDynamicObject();
+    const auto key = juce::Identifier (normalizedIdentity);
+    auto value = object->getProperty (key);
+
+    if (value.isVoid())
+    {
+        if (fallbackResolvedJson.trim().isNotEmpty())
+        {
+            juce::var fallback;
+
+            if (const auto result = juce::JSON::parse (fallbackResolvedJson, fallback); result.failed())
+                return result;
+
+            Mapping ignored;
+
+            if (const auto result = parseMappingObject (fallback, normalizedIdentity, ignored);
+                result.failed())
+                return juce::Result::fail ("Invalid fallback mapping: " + result.getErrorMessage());
+
+            value = fallback;
+        }
+        else
+        {
+            auto* fresh = new juce::DynamicObject();
+            fresh->setProperty ("prefix", "");
+            value = juce::var (fresh);
+        }
+
+        object->setProperty (key, value);
+    }
+
+    auto* entry = value.getDynamicObject();
+
+    if (entry == nullptr)
+        return juce::Result::fail ("Mapping entry must be a JSON object");
+
+    entry->setProperty ("name", name);
+    updatedJson = juce::JSON::toString (root, true);
+    return juce::Result::ok();
 }
 }

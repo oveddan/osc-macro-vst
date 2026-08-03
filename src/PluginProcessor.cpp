@@ -17,19 +17,27 @@ namespace
 constexpr auto sendIntervalMs = 20;
 constexpr auto configPollIntervalMs = 250;
 constexpr auto snapshotIntervalMs = 5000;
+constexpr auto reconnectIntervalMs = 1000;
+constexpr auto processingHeartbeatTimeoutMs = 1000;
+constexpr auto registryRetryIntervalMs = 1000;
 constexpr auto changeEpsilon = 0.0001f;
+
+juce::File mappingsFile()
+{
+    return juce::File::getSpecialLocation (juce::File::userHomeDirectory)
+        .getChildFile (".chromatik-macros")
+        .getChildFile ("mappings.json");
+}
+
+std::mutex& mappingsWriteMutex()
+{
+    static std::mutex instance;
+    return instance;
+}
 
 juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout()
 {
     juce::AudioProcessorValueTreeState::ParameterLayout layout;
-
-    layout.add (std::make_unique<juce::AudioParameterInt> (
-        juce::ParameterID { "slot", 1 },
-        "Slot",
-        1,
-        64,
-        1,
-        juce::AudioParameterIntAttributes().withAutomatable (false)));
 
     for (auto index = 0; index < chromatik::macroCount; ++index)
     {
@@ -42,6 +50,15 @@ juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout()
     }
 
     return layout;
+}
+
+bool hasEnabledRoute (const chromatik::Mapping& mapping)
+{
+    for (const auto& route : mapping.macros)
+        if (route.enabled)
+            return true;
+
+    return false;
 }
 
 class DestinationRegistry
@@ -99,7 +116,59 @@ private:
         return instance;
     }
 };
+
+juce::Result writeMappingEntry (const juce::File& file,
+                                const juce::String& identity,
+                                const juce::String& name,
+                                const juce::String& fallbackResolvedJson)
+{
+    // Several instances can be activated together when a project opens. Keep their
+    // read-modify-write registrations from replacing one another.
+    const std::scoped_lock fileLock (mappingsWriteMutex());
+    const auto currentJson = file.existsAsFile() ? file.loadFileAsString() : juce::String();
+    juce::String updatedJson;
+
+    if (const auto result = chromatik::upsertMappingName (currentJson, identity, name,
+                                                          fallbackResolvedJson, updatedJson);
+        result.failed())
+        return result;
+
+    if (file.getParentDirectory().createDirectory().failed())
+        return juce::Result::fail ("Could not create " + file.getParentDirectory().getFullPathName());
+
+    juce::TemporaryFile temporary (file);
+
+    if (! temporary.getFile().replaceWithText (updatedJson + "\n"))
+        return juce::Result::fail ("Could not write temporary mappings file");
+
+    if (! temporary.overwriteTargetFileWithTemporary())
+        return juce::Result::fail ("Could not replace mappings file");
+
+    return juce::Result::ok();
 }
+}
+
+class ChromatikMacroProcessor;
+
+class ChromatikMacroEditor final : public juce::AudioProcessorEditor,
+                                   private juce::Timer
+{
+public:
+    explicit ChromatikMacroEditor (ChromatikMacroProcessor&);
+
+    void paint (juce::Graphics&) override;
+    void resized() override;
+
+private:
+    void timerCallback() override;
+
+    ChromatikMacroProcessor& owner;
+    juce::Label nameCaption;
+    juce::Label nameEditor;
+    juce::Label status;
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (ChromatikMacroEditor)
+};
 
 class ChromatikMacroProcessor final : public juce::AudioProcessor,
                                       private juce::AsyncUpdater
@@ -109,10 +178,10 @@ public:
         : AudioProcessor (BusesProperties()
                               .withInput ("Input", juce::AudioChannelSet::stereo(), true)
                               .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
-          parameters (*this, nullptr, "ChromatikMacro", createParameterLayout())
+          parameters (*this, nullptr, "ChromatikMacro", createParameterLayout()),
+          instanceIdentity (juce::Uuid().toString()),
+          instanceName ("(unnamed)")
     {
-        slot = parameters.getRawParameterValue ("slot");
-
         for (auto index = 0; index < chromatik::macroCount; ++index)
             macros[static_cast<size_t> (index)] =
                 parameters.getRawParameterValue ("macro" + juce::String (index + 1));
@@ -139,6 +208,7 @@ public:
     void prepareToPlay (double, int) override
     {
         offline.store (isNonRealtime(), std::memory_order_release);
+        lastProcessBlockMs.store (0, std::memory_order_release);
         active.store (true, std::memory_order_release);
         startWorker();
     }
@@ -146,7 +216,9 @@ public:
     void releaseResources() override
     {
         active.store (false, std::memory_order_release);
+        lastProcessBlockMs.store (0, std::memory_order_release);
         stopWorker();
+        setRuntimeStatus (RuntimeState::inactive);
     }
 
     bool isBusesLayoutSupported (const BusesLayout& layouts) const override
@@ -163,6 +235,8 @@ public:
     {
         juce::ScopedNoDenormals noDenormals;
         offline.store (isNonRealtime(), std::memory_order_release);
+        lastProcessBlockMs.store (juce::Time::getMillisecondCounter(),
+                                  std::memory_order_release);
 
         for (auto channel = getTotalNumInputChannels();
              channel < getTotalNumOutputChannels();
@@ -181,16 +255,21 @@ public:
     }
 
     bool supportsDoublePrecisionProcessing() const override { return true; }
-    bool hasEditor() const override { return false; }
-    juce::AudioProcessorEditor* createEditor() override { return nullptr; }
+    bool hasEditor() const override { return true; }
+    juce::AudioProcessorEditor* createEditor() override
+    {
+        return new ChromatikMacroEditor (*this);
+    }
 
     void getStateInformation (juce::MemoryBlock& destination) override
     {
         auto state = parameters.copyState();
 
         {
-            const juce::ScopedLock lock (cacheLock);
-            state.setProperty ("cachedMappingSlot", cachedMappingSlot, nullptr);
+            const juce::ScopedLock lock (stateLock);
+            state.setProperty ("instanceIdentity", instanceIdentity, nullptr);
+            state.setProperty ("instanceName", instanceName, nullptr);
+            state.setProperty ("cachedMappingIdentity", cachedMappingIdentity, nullptr);
             state.setProperty ("cachedMappingJson", cachedMappingJson, nullptr);
         }
 
@@ -207,19 +286,256 @@ public:
             if (! state.hasType (parameters.state.getType()))
                 return;
 
+            const auto restoredIdentity = state.getProperty ("instanceIdentity").toString().trim();
+            const auto restoredName = state.getProperty ("instanceName", "(unnamed)")
+                                          .toString().trim();
+            const auto restoredJson = state.getProperty ("cachedMappingJson").toString();
+            auto restoredCachedIdentity = state.getProperty ("cachedMappingIdentity")
+                                              .toString().trim();
+
             {
-                const juce::ScopedLock lock (cacheLock);
-                cachedMappingSlot = static_cast<int> (state.getProperty ("cachedMappingSlot", 0));
-                cachedMappingJson = state.getProperty ("cachedMappingJson").toString();
+                const juce::ScopedLock lock (stateLock);
+
+                if (restoredIdentity.isNotEmpty())
+                    instanceIdentity = restoredIdentity;
+
+                instanceName = restoredName.isNotEmpty() ? restoredName : "(unnamed)";
+
+                if (restoredCachedIdentity.isEmpty() && restoredJson.isNotEmpty())
+                    restoredCachedIdentity = instanceIdentity;
+
+                cachedMappingIdentity = restoredCachedIdentity;
+                cachedMappingJson = restoredJson;
+                resetRequestedIdentity = instanceIdentity;
+                resetAwaitingMapping = true;
+                resetDispatchReady = false;
+                resetInProgress.store (true, std::memory_order_release);
+                persistedNameEditRevision = nameEditRevision;
             }
 
+            identityRevision.fetch_add (1, std::memory_order_release);
+
+            state.removeProperty ("instanceIdentity", nullptr);
+            state.removeProperty ("instanceName", nullptr);
+            state.removeProperty ("cachedMappingIdentity", nullptr);
             state.removeProperty ("cachedMappingSlot", nullptr);
             state.removeProperty ("cachedMappingJson", nullptr);
             parameters.replaceState (state);
         }
     }
 
+    juce::String getInstanceName() const
+    {
+        const juce::ScopedLock lock (stateLock);
+        return instanceName;
+    }
+
+    void setInstanceNameFromEditor (juce::String name)
+    {
+        name = name.trim();
+
+        if (name.isEmpty())
+            name = "(unnamed)";
+
+        {
+            const juce::ScopedLock lock (stateLock);
+
+            if (instanceName == name)
+                return;
+
+            instanceName = name;
+            ++nameEditRevision;
+        }
+
+        requestAsyncUpdate (asyncHostDirty);
+    }
+
+    juce::String getStatusText() const
+    {
+        const juce::ScopedLock lock (statusLock);
+        return statusText;
+    }
+
 private:
+    enum class RuntimeState
+    {
+        sending,
+        unconfigured,
+        collision,
+        error,
+        offline,
+        inactive
+    };
+
+    struct StateSnapshot
+    {
+        juce::String identity;
+        juce::String name;
+        juce::String cachedIdentity;
+        juce::String cachedJson;
+        uint64_t identityVersion = 0;
+        uint64_t editedNameVersion = 0;
+        uint64_t persistedNameVersion = 0;
+    };
+
+    StateSnapshot getStateSnapshot() const
+    {
+        const juce::ScopedLock lock (stateLock);
+        return { instanceIdentity,
+                 instanceName,
+                 cachedMappingIdentity,
+                 cachedMappingJson,
+                 identityRevision.load (std::memory_order_acquire),
+                 nameEditRevision,
+                 persistedNameEditRevision };
+    }
+
+    void updateResolvedMapping (const chromatik::Mapping& mapping,
+                                const juce::String& json)
+    {
+        auto changed = false;
+
+        {
+            const juce::ScopedLock lock (stateLock);
+
+            if (mapping.identity != instanceIdentity)
+                return;
+
+            if (cachedMappingIdentity != mapping.identity || cachedMappingJson != json)
+            {
+                cachedMappingIdentity = mapping.identity;
+                cachedMappingJson = json;
+                changed = true;
+            }
+
+            const auto resolvedName = mapping.name.trim().isNotEmpty()
+                                        ? mapping.name.trim()
+                                        : juce::String ("(unnamed)");
+
+            if (nameEditRevision == persistedNameEditRevision
+                && instanceName != resolvedName)
+            {
+                instanceName = resolvedName;
+                changed = true;
+            }
+        }
+
+        if (changed)
+            requestAsyncUpdate (asyncHostDirty);
+    }
+
+    void setRuntimeStatus (RuntimeState state,
+                           const juce::String& target = {},
+                           const juce::String& detail = {})
+    {
+        juce::String description;
+
+        switch (state)
+        {
+            case RuntimeState::sending:      description = "sending"; break;
+            case RuntimeState::unconfigured: description = "unconfigured"; break;
+            case RuntimeState::collision:    description = "collision"; break;
+            case RuntimeState::error:        description = "error"; break;
+            case RuntimeState::offline:      description = "offline"; break;
+            case RuntimeState::inactive:     description = "inactive"; break;
+        }
+
+        if (detail.isNotEmpty())
+            description += ": " + detail;
+
+        const auto next = target.isNotEmpty() ? target + " — " + description : description;
+        const juce::ScopedLock lock (statusLock);
+        statusText = next;
+    }
+
+    void acknowledgeNameEdit (uint64_t revision)
+    {
+        const juce::ScopedLock lock (stateLock);
+
+        if (revision > persistedNameEditRevision)
+            persistedNameEditRevision = revision;
+    }
+
+    void queueResetFromResolvedMapping (const chromatik::Mapping& mapping)
+    {
+        {
+            const juce::ScopedLock lock (stateLock);
+
+            if (! resetAwaitingMapping || mapping.identity != resetRequestedIdentity
+                || mapping.identity != instanceIdentity)
+                return;
+
+            resetAwaitingMapping = false;
+            resetDispatchReady = true;
+            resetDispatchIdentity = mapping.identity;
+
+            for (auto index = 0; index < chromatik::macroCount; ++index)
+            {
+                const auto& route = mapping.macros[static_cast<size_t> (index)];
+                resetDispatchEnabled[static_cast<size_t> (index)] =
+                    route.enabled && route.resetOnLoad;
+                resetDispatchValues[static_cast<size_t> (index)] = route.initial;
+            }
+        }
+
+        requestAsyncUpdate (asyncResetDispatch);
+    }
+
+    void dispatchPendingReset()
+    {
+        std::array<float, chromatik::macroCount> values {};
+        std::array<bool, chromatik::macroCount> enabled {};
+
+        {
+            const juce::ScopedLock lock (stateLock);
+
+            if (! resetDispatchReady || resetDispatchIdentity != instanceIdentity)
+                return;
+
+            resetDispatchReady = false;
+            values = resetDispatchValues;
+            enabled = resetDispatchEnabled;
+        }
+
+        for (auto index = 0; index < chromatik::macroCount; ++index)
+        {
+            if (! enabled[static_cast<size_t> (index)])
+                continue;
+
+            if (auto* parameter = parameters.getParameter ("macro" + juce::String (index + 1)))
+                parameter->setValueNotifyingHost (
+                    parameter->convertTo0to1 (values[static_cast<size_t> (index)]));
+        }
+
+        resetInProgress.store (false, std::memory_order_release);
+    }
+
+    void requestAsyncUpdate (unsigned int reason)
+    {
+        pendingAsyncActions.fetch_or (reason, std::memory_order_release);
+        triggerAsyncUpdate();
+    }
+
+    void dispatchAsyncActions()
+    {
+        const auto actions = pendingAsyncActions.exchange (0, std::memory_order_acq_rel);
+
+        if ((actions & asyncResetDispatch) != 0)
+            dispatchPendingReset();
+
+        if ((actions & asyncHostDirty) != 0)
+            updateHostDisplay (
+                juce::AudioProcessorListener::ChangeDetails().withNonParameterStateChanged (true));
+
+        // If a worker request arrived while this callback was executing, make sure
+        // it receives another message-thread turn.
+        if (pendingAsyncActions.load (std::memory_order_acquire) != 0)
+            triggerAsyncUpdate();
+    }
+
+    static constexpr unsigned int asyncHostDirty = 1u << 0;
+    static constexpr unsigned int asyncResetDispatch = 1u << 1;
+
     class Worker final : public juce::Thread
     {
     public:
@@ -260,96 +576,135 @@ private:
         }
 
     private:
+        enum class MappingSource
+        {
+            none,
+            file,
+            cachedState
+        };
+
         void reloadMapping()
         {
-            const auto requestedSlot = juce::roundToInt (
-                processor.slot->load (std::memory_order_relaxed));
-            const auto slotChanged = requestedSlot != currentSlot;
+            const auto snapshot = processor.getStateSnapshot();
 
-            if (slotChanged)
+            if (snapshot.identityVersion != currentIdentityVersion
+                || snapshot.identity != currentIdentity)
             {
-                currentSlot = requestedSlot;
+                currentIdentityVersion = snapshot.identityVersion;
+                currentIdentity = snapshot.identity;
+                processedNameEditRevision = 0;
+                loggedSource = MappingSource::none;
                 clearMapping();
             }
 
-            const auto file = juce::File::getSpecialLocation (juce::File::userHomeDirectory)
-                                  .getChildFile (".chromatik-macros")
-                                  .getChildFile ("mappings.json");
+            const auto file = mappingsFile();
+
+            if (snapshot.editedNameVersion > snapshot.persistedNameVersion
+                && snapshot.editedNameVersion != processedNameEditRevision)
+            {
+                const auto fallback = snapshot.cachedIdentity == snapshot.identity
+                                          ? snapshot.cachedJson
+                                          : juce::String();
+                const auto result = writeMappingEntry (file, snapshot.identity,
+                                                       snapshot.name, fallback);
+
+                if (result.failed())
+                    reportError (result.getErrorMessage());
+                else
+                {
+                    processedNameEditRevision = snapshot.editedNameVersion;
+                    processor.acknowledgeNameEdit (snapshot.editedNameVersion);
+                }
+            }
 
             if (file.existsAsFile())
             {
                 chromatik::Mapping candidate;
                 juce::String resolvedJson;
                 const auto result = chromatik::parseMappingsFile (
-                    file.loadFileAsString(), currentSlot, candidate, resolvedJson);
+                    file.loadFileAsString(), currentIdentity, candidate, resolvedJson);
 
                 if (result.wasOk())
                 {
-                    applyMapping (candidate, resolvedJson);
-                    processor.updateCachedMapping (currentSlot, resolvedJson);
+                    applyMapping (candidate, resolvedJson, MappingSource::file);
                     lastError.clear();
                     return;
                 }
 
-                if (result.getErrorMessage().startsWith ("No mapping exists"))
-                    clearMapping();
-
-                reportError ("Slot " + juce::String (currentSlot) + ": "
-                             + result.getErrorMessage());
-            }
-
-            if (! hasMapping)
-            {
-                const auto cached = processor.getCachedMapping();
-
-                if (cached.slot == currentSlot && cached.json.isNotEmpty())
+                if (! result.getErrorMessage().startsWith ("No mapping exists"))
                 {
-                    chromatik::Mapping candidate;
-                    const auto result = chromatik::parseResolvedMapping (
-                        cached.json, currentSlot, candidate);
-
-                    if (result.wasOk())
-                        applyMapping (candidate, cached.json);
-                    else
-                        reportError ("Cached mapping is invalid: " + result.getErrorMessage());
+                    reportError ("Identity " + currentIdentity + ": "
+                                 + result.getErrorMessage());
+                    restoreCachedMapping (snapshot);
+                    return;
                 }
             }
+
+            if (restoreCachedMapping (snapshot))
+            {
+                // Re-register the cached object so it remains editable, without
+                // replacing its routing with a blank first-run entry.
+                const auto result = writeMappingEntry (file, snapshot.identity,
+                                                       snapshot.name,
+                                                       snapshot.cachedJson);
+                if (result.failed())
+                    reportError (result.getErrorMessage());
+                return;
+            }
+
+            const auto result = writeMappingEntry (file, snapshot.identity,
+                                                   snapshot.name, {});
+            if (result.failed())
+                reportError (result.getErrorMessage());
+            else
+                processor.setRuntimeStatus (RuntimeState::unconfigured,
+                                            "127.0.0.1:3030");
+        }
+
+        bool restoreCachedMapping (const StateSnapshot& snapshot)
+        {
+            if (hasMapping || snapshot.cachedJson.isEmpty()
+                || snapshot.cachedIdentity != snapshot.identity)
+                return hasMapping;
+
+            chromatik::Mapping candidate;
+            const auto result = chromatik::parseResolvedMapping (
+                snapshot.cachedJson, snapshot.identity, candidate);
+
+            if (result.wasOk())
+            {
+                applyMapping (candidate, snapshot.cachedJson, MappingSource::cachedState);
+                return true;
+            }
+
+            reportError ("Cached mapping is invalid: " + result.getErrorMessage());
+            return false;
         }
 
         void applyMapping (const chromatik::Mapping& candidate,
-                           const juce::String& sourceJson)
+                           const juce::String& sourceJson,
+                           MappingSource source)
         {
-            if (hasMapping && sourceJson == activeSourceJson)
-            {
-                if (collision && DestinationRegistry::acquire (this, mapping))
-                {
-                    collision = false;
-                    connected = sender.connect (mapping.host, mapping.port);
-                    fullSnapshotNeeded = true;
-                    lastError.clear();
-                }
-
+            if (candidate.identity != currentIdentity)
                 return;
-            }
+
+            noteResolvedSource (source);
+            processor.queueResetFromResolvedMapping (candidate);
+
+            if (hasMapping && sourceJson == activeSourceJson)
+                return;
 
             clearMapping();
             mapping = candidate;
             activeSourceJson = sourceJson;
             hasMapping = true;
-            collision = ! DestinationRegistry::acquire (this, mapping);
+            processor.updateResolvedMapping (mapping, sourceJson);
 
-            if (collision)
+            if (mapping.prefix.isEmpty() || ! hasEnabledRoute (mapping))
             {
-                reportError ("Duplicate OSC destination detected for slot "
-                             + juce::String (mapping.slot));
+                processor.setRuntimeStatus (RuntimeState::unconfigured, targetFor (mapping));
                 return;
             }
-
-            connected = sender.connect (mapping.host, mapping.port);
-
-            if (! connected)
-                reportError ("Could not connect OSC sender to " + mapping.host + ":"
-                             + juce::String (mapping.port));
 
             lastSent.fill (std::numeric_limits<float>::quiet_NaN());
             fullSnapshotNeeded = true;
@@ -362,17 +717,47 @@ private:
             hasMapping = false;
             connected = false;
             collision = false;
+            ownsDestination = false;
             activeSourceJson.clear();
             fullSnapshotNeeded = true;
         }
 
         void sendValues (uint32_t now)
         {
+            if (processor.identityRevision.load (std::memory_order_acquire)
+                != currentIdentityVersion)
+                return;
+
+            if (processor.resetInProgress.load (std::memory_order_acquire))
+                return;
+
+            const auto isOffline = processor.offline.load (std::memory_order_acquire);
             const auto suppressed = ! processor.active.load (std::memory_order_acquire)
-                                 || processor.offline.load (std::memory_order_acquire);
+                                 || isOffline;
 
             if (suppressed)
             {
+                relinquishDestination();
+
+                if (isOffline)
+                    processor.setRuntimeStatus (RuntimeState::offline,
+                                                hasMapping ? targetFor (mapping)
+                                                           : juce::String());
+                wasSuppressed = true;
+                return;
+            }
+
+            const auto lastProcess = processor.lastProcessBlockMs.load (
+                std::memory_order_acquire);
+            const auto processAge = static_cast<int32_t> (now - lastProcess);
+
+            if (lastProcess == 0
+                || processAge > processingHeartbeatTimeoutMs)
+            {
+                relinquishDestination();
+                processor.setRuntimeStatus (RuntimeState::inactive,
+                                            hasMapping ? targetFor (mapping)
+                                                       : juce::String());
                 wasSuppressed = true;
                 return;
             }
@@ -381,19 +766,48 @@ private:
             {
                 fullSnapshotNeeded = true;
                 wasSuppressed = false;
+
+                if (hasMapping && ! collision && connected)
+                    processor.setRuntimeStatus (RuntimeState::sending, targetFor (mapping));
             }
 
-            if (! hasMapping || collision)
+            if (! hasMapping || mapping.prefix.isEmpty()
+                || ! hasEnabledRoute (mapping))
                 return;
+
+            if (! ownsDestination)
+            {
+                if (now - lastRegistryAttempt < registryRetryIntervalMs)
+                    return;
+
+                lastRegistryAttempt = now;
+                ownsDestination = DestinationRegistry::acquire (this, mapping);
+                collision = ! ownsDestination;
+
+                if (collision)
+                {
+                    processor.setRuntimeStatus (RuntimeState::collision, targetFor (mapping));
+                    reportError ("Duplicate OSC destination detected for identity "
+                                 + mapping.identity, false);
+                    return;
+                }
+
+                connected = false;
+                fullSnapshotNeeded = true;
+            }
 
             if (! connected)
             {
-                connected = sender.connect (mapping.host, mapping.port);
+                if (now - lastConnectAttempt < reconnectIntervalMs)
+                    return;
+
+                connected = attemptConnect (now);
 
                 if (! connected)
                     return;
 
                 fullSnapshotNeeded = true;
+                processor.setRuntimeStatus (RuntimeState::sending, targetFor (mapping));
             }
 
             const auto periodicSnapshot = now - lastSnapshot >= snapshotIntervalMs;
@@ -424,6 +838,9 @@ private:
                 else
                 {
                     connected = false;
+                    lastConnectAttempt = now;
+                    processor.setRuntimeStatus (RuntimeState::error, targetFor (mapping),
+                                                "send failed");
                     break;
                 }
             }
@@ -435,14 +852,60 @@ private:
             }
         }
 
-        void reportError (const juce::String& message)
+        static juce::String targetFor (const chromatik::Mapping& value)
         {
+            return value.host + ":" + juce::String (value.port);
+        }
+
+        bool attemptConnect (uint32_t now)
+        {
+            lastConnectAttempt = now;
+            return sender.connect (mapping.host, mapping.port);
+        }
+
+        void relinquishDestination()
+        {
+            if (! ownsDestination && ! connected && ! collision)
+                return;
+
+            if (ownsDestination)
+                DestinationRegistry::release (this);
+
+            ownsDestination = false;
+            collision = false;
+            connected = false;
+            sender.disconnect();
+        }
+
+        void noteResolvedSource (MappingSource source)
+        {
+            if (source == loggedSource)
+                return;
+
+            loggedSource = source;
+            logMessage ("Identity " + currentIdentity + " resolved from "
+                        + (source == MappingSource::file ? "file entry"
+                                                        : "cached state"));
+        }
+
+        void reportError (const juce::String& message, bool updateStatus = true)
+        {
+            if (updateStatus)
+                processor.setRuntimeStatus (RuntimeState::error,
+                                            hasMapping ? targetFor (mapping)
+                                                       : juce::String(),
+                                            message);
+
             if (message == lastError)
                 return;
 
             lastError = message;
-            const auto directory = juce::File::getSpecialLocation (juce::File::userHomeDirectory)
-                                       .getChildFile (".chromatik-macros");
+            logMessage (message);
+        }
+
+        static void logMessage (const juce::String& message)
+        {
+            const auto directory = mappingsFile().getParentDirectory();
 
             if (directory.createDirectory().failed())
                 return;
@@ -460,47 +923,25 @@ private:
         chromatik::Mapping mapping;
         std::array<float, chromatik::macroCount> lastSent {};
         juce::String activeSourceJson;
+        juce::String currentIdentity;
         juce::String lastError;
-        int currentSlot = 0;
+        uint64_t currentIdentityVersion = std::numeric_limits<uint64_t>::max();
+        uint64_t processedNameEditRevision = 0;
         uint32_t lastSnapshot = 0;
+        uint32_t lastConnectAttempt = 0;
+        uint32_t lastRegistryAttempt = 0;
+        MappingSource loggedSource = MappingSource::none;
         bool hasMapping = false;
         bool connected = false;
         bool collision = false;
+        bool ownsDestination = false;
         bool fullSnapshotNeeded = true;
         bool wasSuppressed = false;
     };
 
-    struct CachedMapping
-    {
-        int slot = 0;
-        juce::String json;
-    };
-
-    CachedMapping getCachedMapping() const
-    {
-        const juce::ScopedLock lock (cacheLock);
-        return { cachedMappingSlot, cachedMappingJson };
-    }
-
-    void updateCachedMapping (int mappingSlot, const juce::String& json)
-    {
-        {
-            const juce::ScopedLock lock (cacheLock);
-
-            if (cachedMappingSlot == mappingSlot && cachedMappingJson == json)
-                return;
-
-            cachedMappingSlot = mappingSlot;
-            cachedMappingJson = json;
-        }
-
-        triggerAsyncUpdate();
-    }
-
     void handleAsyncUpdate() override
     {
-        updateHostDisplay (
-            juce::AudioProcessorListener::ChangeDetails().withNonParameterStateChanged (true));
+        dispatchAsyncActions();
     }
 
     void startWorker()
@@ -524,18 +965,85 @@ private:
     }
 
     juce::AudioProcessorValueTreeState parameters;
-    std::atomic<float>* slot = nullptr;
     std::array<std::atomic<float>*, chromatik::macroCount> macros {};
     std::atomic<bool> active { false };
     std::atomic<bool> offline { false };
+    std::atomic<bool> resetInProgress { false };
+    std::atomic<uint32_t> lastProcessBlockMs { 0 };
+    std::atomic<uint64_t> identityRevision { 0 };
+    std::atomic<unsigned int> pendingAsyncActions { 0 };
     std::unique_ptr<Worker> worker;
 
-    mutable juce::CriticalSection cacheLock;
-    int cachedMappingSlot = 0;
+    mutable juce::CriticalSection stateLock;
+    juce::String instanceIdentity;
+    juce::String instanceName;
+    juce::String cachedMappingIdentity;
     juce::String cachedMappingJson;
+    uint64_t nameEditRevision = 0;
+    uint64_t persistedNameEditRevision = 0;
+    juce::String resetRequestedIdentity;
+    juce::String resetDispatchIdentity;
+    std::array<float, chromatik::macroCount> resetDispatchValues {};
+    std::array<bool, chromatik::macroCount> resetDispatchEnabled {};
+    bool resetAwaitingMapping = false;
+    bool resetDispatchReady = false;
 
+    mutable juce::CriticalSection statusLock;
+    juce::String statusText { "inactive" };
+
+    friend class ChromatikMacroEditor;
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (ChromatikMacroProcessor)
 };
+
+ChromatikMacroEditor::ChromatikMacroEditor (ChromatikMacroProcessor& processorToUse)
+    : AudioProcessorEditor (processorToUse), owner (processorToUse)
+{
+    nameCaption.setText ("Name", juce::dontSendNotification);
+    nameCaption.setJustificationType (juce::Justification::centredLeft);
+    addAndMakeVisible (nameCaption);
+
+    nameEditor.setText (owner.getInstanceName(), juce::dontSendNotification);
+    nameEditor.setEditable (true, true, false);
+    nameEditor.setColour (juce::Label::backgroundColourId,
+                          getLookAndFeel().findColour (juce::TextEditor::backgroundColourId));
+    nameEditor.setColour (juce::Label::outlineColourId,
+                          getLookAndFeel().findColour (juce::TextEditor::outlineColourId));
+    nameEditor.onTextChange = [this]
+    {
+        owner.setInstanceNameFromEditor (nameEditor.getText());
+    };
+    addAndMakeVisible (nameEditor);
+
+    status.setText (owner.getStatusText(), juce::dontSendNotification);
+    status.setJustificationType (juce::Justification::centredLeft);
+    addAndMakeVisible (status);
+
+    setSize (440, 104);
+    startTimerHz (4);
+}
+
+void ChromatikMacroEditor::paint (juce::Graphics& graphics)
+{
+    graphics.fillAll (getLookAndFeel().findColour (juce::ResizableWindow::backgroundColourId));
+}
+
+void ChromatikMacroEditor::resized()
+{
+    auto area = getLocalBounds().reduced (12);
+    auto nameRow = area.removeFromTop (32);
+    nameCaption.setBounds (nameRow.removeFromLeft (48));
+    nameEditor.setBounds (nameRow);
+    area.removeFromTop (10);
+    status.setBounds (area.removeFromTop (26));
+}
+
+void ChromatikMacroEditor::timerCallback()
+{
+    if (! nameEditor.isBeingEdited())
+        nameEditor.setText (owner.getInstanceName(), juce::dontSendNotification);
+
+    status.setText (owner.getStatusText(), juce::dontSendNotification);
+}
 
 juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
 {
