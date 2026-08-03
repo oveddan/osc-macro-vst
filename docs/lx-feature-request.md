@@ -12,6 +12,17 @@ label and location
 
 ## Problem
 
+**Renaming a channel or a modulator in Chromatik silently breaks every external
+controller pointed at it.** So does moving a modulator to a different parent. There is
+no error and no warning on either side — the control simply stops doing anything, and
+the obvious suspects are the controller, the network, or your own patch. It can be
+weeks before anyone notices, and there is no way to audit it from inside Chromatik.
+
+Renaming a channel is an ordinary thing to do while building a show. Today it is a
+destructive act for external control.
+
+## Why it happens
+
 A component's OSC address is derived entirely from where it sits and what it is
 called. In `LXModulator`:
 
@@ -39,26 +50,21 @@ So a `MacroKnobs` bank reachable at:
 /lx/mixer/channel/9/modulation/LevelsB/macro3
 ```
 
-changes address if you rename the modulator, rename the channel, or move the
-modulator to a different parent. Reordering channels is safe, since channels also
-resolve by name — but renames and moves are not.
+moves address if the modulator is renamed, the channel is renamed, or the modulator is
+reparented. Reordering channels is safe, since channels also resolve by name — but
+renames and moves are not.
 
-That is reasonable as a default. The difficulty is that **OSC is one-way over UDP**,
-so an external sender has no way to learn its address stopped resolving. A rename in
-Chromatik silently breaks every external controller pointed at that component, with no
-error on either side. The symptom is a control that simply stops doing anything, which
-is easy to attribute to the controller, the network, or one's own patch.
+That derivation is a reasonable default. The difficulty is that **OSC is one-way over
+UDP**, so a sender has no way to learn its address stopped resolving.
 
-## Why it matters in practice
+## Impact in practice
 
 We drive a Chromatik show from Bitwig Studio, with ~25 plugin instances each sending
 to a different macro bank, and ~150 modulation wirings hanging off those banks. The
 addresses are typed into each plugin instance by hand.
 
-Every rename or reorganisation on the Chromatik side is therefore a silent breakage
-we only discover later, and auditing it means reconstructing the mapping from outside
-Chromatik entirely. Renaming a channel — an ordinary thing to do while building a
-show — is currently a destructive act for external control.
+Every reorganisation on the Chromatik side is therefore a potential silent breakage,
+and auditing it means reconstructing the mapping from outside Chromatik entirely.
 
 ## Request
 
