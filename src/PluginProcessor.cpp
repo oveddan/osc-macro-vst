@@ -1,4 +1,5 @@
 #include "MappingConfig.h"
+#include "ParamIds.h"
 
 #include <juce_audio_utils/juce_audio_utils.h>
 #include <juce_osc/juce_osc.h>
@@ -76,16 +77,47 @@ juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout()
 
     for (auto index = 0; index < oscmacro::macroCount; ++index)
     {
-        const auto id = "macro" + juce::String (index + 1);
+        // ParameterID is the cryptic VST3-compatibility string (see ParamIds.h);
+        // the second argument is the human-visible name, which stays "macroN".
         layout.add (std::make_unique<juce::AudioParameterFloat> (
-            juce::ParameterID { id, 1 },
-            id,
+            juce::ParameterID { oscmacro::paramIds[static_cast<size_t> (index)], 1 },
+            oscmacro::paramName (index),
             juce::NormalisableRange<float> { 0.0f, 1.0f },
             0.0f));
     }
 
     return layout;
 }
+
+// Whether to advertise VST3 class-ID compatibility with OSCpar (see
+// OSCMacroVST3ClientExtensions below). Flip to false to disable without
+// deleting the implementation - whether Bitwig honours VST3
+// IPluginCompatibility / getCompatibleClasses() declarations at all is
+// UNTESTED.
+constexpr bool advertiseOscParCompatibility = true;
+
+// OSCpar's VST3 class UID, formatted exactly as
+// juce::VST3ClientExtensions::getCompatibleClasses() documents: "a
+// 32-character string consisting only of the characters 0-9 and A-F".
+//
+// This is a *compatibility* declaration, not identity impersonation: OSCMacro
+// keeps its own VST3 class UID (derived from PLUGIN_MANUFACTURER_CODE /
+// PLUGIN_CODE in CMakeLists.txt, both unchanged). This only tells a host that
+// implements IPluginCompatibility that this plugin can stand in for OSCpar -
+// it does not claim to *be* OSCpar.
+constexpr auto oscParCompatibleClassId = "ABCDEF019182FAEB4550666C4F534368";
+
+class OSCMacroVST3ClientExtensions final : public juce::VST3ClientExtensions
+{
+public:
+    std::vector<juce::String> getCompatibleClasses() const override
+    {
+        if (! advertiseOscParCompatibility)
+            return {};
+
+        return { juce::String (oscParCompatibleClassId) };
+    }
+};
 
 bool hasEnabledRoute (const oscmacro::Mapping& mapping)
 {
@@ -220,7 +252,7 @@ public:
     {
         for (auto index = 0; index < oscmacro::macroCount; ++index)
             macros[static_cast<size_t> (index)] =
-                parameters.getRawParameterValue ("macro" + juce::String (index + 1));
+                parameters.getRawParameterValue (oscmacro::paramIds[static_cast<size_t> (index)]);
     }
 
     ~OSCMacroProcessor() override
@@ -292,6 +324,12 @@ public:
 
     bool supportsDoublePrecisionProcessing() const override { return true; }
     bool hasEditor() const override { return true; }
+
+    juce::VST3ClientExtensions* getVST3ClientExtensions() override
+    {
+        return &vst3ClientExtensions;
+    }
+
     juce::AudioProcessorEditor* createEditor() override
     {
         return new OSCMacroEditor (*this);
@@ -538,7 +576,7 @@ private:
             if (! enabled[static_cast<size_t> (index)])
                 continue;
 
-            if (auto* parameter = parameters.getParameter ("macro" + juce::String (index + 1)))
+            if (auto* parameter = parameters.getParameter (oscmacro::paramIds[static_cast<size_t> (index)]))
                 parameter->setValueNotifyingHost (
                     parameter->convertTo0to1 (values[static_cast<size_t> (index)]));
         }
@@ -1004,6 +1042,7 @@ private:
     }
 
     juce::AudioProcessorValueTreeState parameters;
+    OSCMacroVST3ClientExtensions vst3ClientExtensions;
     std::array<std::atomic<float>*, oscmacro::macroCount> macros {};
     std::atomic<bool> active { false };
     std::atomic<bool> offline { false };

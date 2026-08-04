@@ -368,22 +368,41 @@ The current show contains 25 such instances. The migration uses an existing loca
 `.bwproject` preset extractor (`bwproject.py presets <file>`); that extractor and the
 show project are not part of this repository.
 
-### How much of the switchover can be scripted?
+### Modulation wiring now survives the device swap
 
-Honest split — the addressing config can be generated, the device swap cannot.
+Bitwig stores a modulation target as a string of the form
+`...CONTENTS/ROOT_GENERIC_MODULE/PID<hex>`, where `<hex>` is the lowercase hex of the
+target plugin's VST3 parameter ID — and JUCE derives that ID from the plugin's
+`ParameterID` string via `juceParamID.hashCode() & ~(1u << 31)`. OSCMacro's eight
+macro parameters use `ParameterID`s that are a **solved preimage** of that hash,
+chosen so they land on OSCpar's exact IDs (`0x08eaca05`–`0x08eaca0c`, i.e.
+`PID8eaca05`–`PID8eaca0c`). See `src/ParamIds.h` for the string table and the
+regression test in `tests/VST3ParamIdTests.cpp` that pins all eight values.
+
+This does **not** make the OSCpar → OSCMacro device swap itself scriptable — see the
+table below, that part is still manual/UI-driven — but it removes the cost that used
+to follow the swap: **once an OSCMacro instance replaces an OSCpar instance on a
+track, Bitwig's existing modulator connections re-attach to it automatically**,
+because the parameter IDs they reference already match. No per-modulator drag
+operations, and no rewriting the human names to match a Bitwig-visible label. The
+human-visible parameter name (`macro1`..`macro8`, what Bitwig's generic panel shows)
+is unaffected by this — only the underlying VST3 parameter ID changed, and that ID is
+not normally user-visible at all.
+
+### How much of the switchover can be scripted?
 
 | step | scriptable? |
 |---|---|
 | Back up the project | yes — the `.bwproject` is a single file, just copy it |
 | Extract all 25 OSCpar prefixes, ports and per-macro scaling | **yes** — already working (`bwproject.py presets`) |
 | Merge those routes into self-registered UUID entries, matched by human name | **yes, after the replacement instances have registered** |
-| Replace the OSCpar device with the new plugin in the project file | **no — do not attempt.** Swapping the device means rewriting the VST3 class ID, plugin name, vendor and file path, all length-prefixed strings of different lengths, inside a binary container whose size/offset fields are not understood. One wrong byte and the project will not open. |
-| Re-assign each Bitwig modulator to the new device's parameters | **no** — manual |
+| Replace the OSCpar device with the new plugin in the project file | **no — do not attempt via direct file edits.** Swapping the device means rewriting the VST3 class ID, plugin name, vendor and file path, all length-prefixed strings of different lengths, inside a binary container whose size/offset fields are not understood. One wrong byte and the project will not open. Do this in the Bitwig UI (delete OSCpar, insert OSCMacro) instead. |
+| Re-assign each Bitwig modulator to the new device's parameters | **no longer needed** — the parameter IDs match, so existing modulator connections resolve to the new device automatically once it occupies the same slot. Verify this is actually true on a real project before relying on it broadly (tracked as an open item; not yet exercised end-to-end against a live Bitwig project). |
 
-So the realistic cost is the modulation re-assignments: 25 instances with up to 8
-modulators each, worst case ~100 drag operations. The *addressing* — prefixes,
-scaling, which macros are live — comes across automatically, which is the part that
-was tedious and error-prone to redo by hand.
+So the realistic remaining cost is UI-driven device replacement across 25 instances
+(delete OSCpar, insert OSCMacro, in the Bitwig UI), not the modulator re-assignment
+that used to follow it. The *addressing* — prefixes, scaling, which macros are live —
+still comes across via the generated/merged `mappings.json` entries as before.
 
 Practical approach:
 
@@ -392,27 +411,45 @@ Practical approach:
    `mappings.json`; give each instance a unique name in its editor.
 3. Generate or merge the extracted OSCpar routes into those registered entries by
    matching the human names. UUIDs cannot be generated ahead of instantiation.
-4. Migrate **one track at a time**. Both plugins can coexist — different class IDs,
-   no conflict — so there is no flag day.
+4. Migrate **one track at a time**, in the Bitwig UI: insert the OSCMacro instance,
+   confirm its existing modulator connections carried over, then delete the OSCpar
+   instance. Both plugins can coexist during the swap — different class IDs, no
+   conflict — so there is no flag day.
 5. While a track is mid-migration, make sure only one of the two is sending to a
    given OSC address. Two senders on one address is last-packet-wins and looks like
    random jitter rather than an obvious failure.
 6. Delete the OSCpar instance once its replacement is verified.
 
-The one route that avoids the manual re-assignment entirely is class-ID
-impersonation, below — but it conflicts with shipping this as a general-purpose
-plugin.
+### OSCpar class-ID compatibility declaration
 
-### OSCpar class-ID compatibility option
+Matching parameter IDs (above) handles the *within-a-device* wiring, but Bitwig still
+has to be told that a *new* OSCMacro instance should inherit an *existing* OSCpar
+device's identity to skip the manual delete-and-reinsert step entirely.
 
-A private-rig migration could build the replacement using OSCpar's VST3 class ID and
-an exactly matching parameter layout. If Bitwig resolves the existing devices to it,
-all current modulation routing survives with no project edits at all. Verify first
-that Bitwig's `PID8eaca05`–`PID8eaca0c` parameter derivation matches the replacement
-schema.
+The VST3 spec has a mechanism for exactly this: `IPluginCompatibility`, which lets a
+plugin declare "I can replace class UID X." OSCMacro declares this via
+`AudioProcessor::getVST3ClientExtensions()` returning a
+`VST3ClientExtensions::getCompatibleClasses()` override that lists OSCpar's class UID
+(`ABCDEF019182FAEB4550666C4F534368`) — see `src/PluginProcessor.cpp`
+(`OSCMacroVST3ClientExtensions`). This shows up in the built plugin's
+`moduleinfo.json` as a `Compatibility` entry mapping OSCMacro's own class UID to
+OSCpar's as an "Old" ID it supersedes. **Crucially, OSCMacro keeps its own VST3 class
+UID** (from `PLUGIN_MANUFACTURER_CODE`/`PLUGIN_CODE` in `CMakeLists.txt`, unchanged) —
+this is a compatibility declaration, not UID reuse or impersonation, so it does not
+conflict with OSCpar also being installed and does not require OSCMacro to pretend to
+be OSCpar.
 
-Not the default strategy: reusing another vendor's UID is class-ID squatting, breaks
-if OSCpar is also installed, and is acceptable only as a controlled private technique.
+**Status: implemented but UNTESTED.** It is not known whether Bitwig actually reads
+`IPluginCompatibility` / `moduleinfo.json` compatibility entries and offers
+"replace with a compatible plugin" for an existing device — this varies by host, and
+Bitwig's behaviour here has not been checked against a real project. It is gated
+behind `advertiseOscParCompatibility` in `PluginProcessor.cpp` so it can be disabled
+without removing the code if it turns out to cause problems (e.g. Bitwig picking
+OSCMacro instead of OSCpar in some listing, or vice versa, when both are installed).
+If it works, combined with the matching parameter IDs above, migration could become
+close to zero-rewiring: Bitwig replaces the device and keeps the wiring, both from one
+mechanism. If it doesn't work, the parameter-ID matching above still saves the
+modulator re-assignment step after a manual device swap in the UI.
 
 ---
 

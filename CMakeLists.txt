@@ -53,4 +53,16 @@ if(BUILD_TESTING)
     juce::juce_recommended_config_flags
     juce::juce_recommended_warning_flags)
   add_test(NAME mapping-config COMMAND OSCMacroTests)
+
+  # Regression guard for the OSCpar-compatible VST3 parameter IDs in
+  # src/ParamIds.h - see that file and tests/VST3ParamIdTests.cpp for why.
+  add_executable(OSCMacroVST3ParamIdTests
+    tests/VST3ParamIdTests.cpp
+    src/MappingConfig.cpp)
+  target_include_directories(OSCMacroVST3ParamIdTests PRIVATE src)
+  target_link_libraries(OSCMacroVST3ParamIdTests PRIVATE
+    juce::juce_core
+    juce::juce_recommended_config_flags
+    juce::juce_recommended_warning_flags)
+  add_test(NAME vst3-param-ids COMMAND OSCMacroVST3ParamIdTests)
 endif()
