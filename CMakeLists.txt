@@ -37,6 +37,7 @@ target_compile_definitions(OSCMacro PUBLIC
 target_link_libraries(OSCMacro PRIVATE
   juce::juce_audio_utils
   juce::juce_osc
+  juce::juce_cryptography
   PUBLIC
   juce::juce_recommended_config_flags
   juce::juce_recommended_warning_flags)
@@ -50,6 +51,7 @@ if(BUILD_TESTING)
   target_include_directories(OSCMacroTests PRIVATE src)
   target_link_libraries(OSCMacroTests PRIVATE
     juce::juce_core
+    juce::juce_cryptography
     juce::juce_recommended_config_flags
     juce::juce_recommended_warning_flags)
   add_test(NAME mapping-config COMMAND OSCMacroTests)
@@ -62,7 +64,22 @@ if(BUILD_TESTING)
   target_include_directories(OSCMacroVST3ParamIdTests PRIVATE src)
   target_link_libraries(OSCMacroVST3ParamIdTests PRIVATE
     juce::juce_core
+    juce::juce_cryptography
     juce::juce_recommended_config_flags
     juce::juce_recommended_warning_flags)
   add_test(NAME vst3-param-ids COMMAND OSCMacroVST3ParamIdTests)
+
+  # OSCpar -> OSCMacro state-chunk adoption (see MappingConfig.h's
+  # "OSCpar migration (adoption)" section and README.md's "Migration from
+  # OSCpar").
+  add_executable(OSCMacroOscParAdoptionTests
+    tests/OscParAdoptionTests.cpp
+    src/MappingConfig.cpp)
+  target_include_directories(OSCMacroOscParAdoptionTests PRIVATE src)
+  target_link_libraries(OSCMacroOscParAdoptionTests PRIVATE
+    juce::juce_core
+    juce::juce_cryptography
+    juce::juce_recommended_config_flags
+    juce::juce_recommended_warning_flags)
+  add_test(NAME oscpar-adoption COMMAND OSCMacroOscParAdoptionTests)
 endif()

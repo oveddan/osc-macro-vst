@@ -353,20 +353,92 @@ not currently prune their entries, so remove confirmed orphans by hand when need
 
 ## Migration from OSCpar
 
-The routing portion of `mappings.json` can be **generated**, not hand-written, after
-the new UUID entries have self-registered. OSCpar stores its full config as plaintext
-XML inside a ZIP appended to the `.bwproject` file:
+**The working procedure, end to end:**
+
+1. Back up the `.bwproject` file.
+2. Patch the OSCpar device's class UID to OSCMacro's in the project file, so Bitwig
+   instantiates OSCMacro where OSCpar used to be. (Done with an existing local
+   `.bwproject` patcher, not part of this repository — the project file is a single
+   file, and this rewrite is narrow: only the class UID changes, the rest of the
+   device entry, including its state chunk, is untouched.)
+3. Clear Bitwig's plugin-state cache at
+   `~/Library/Application Support/Bitwig/Bitwig Studio/plugin-states/`. Stale entries
+   there reference the old OSCpar class UID and cause a **"Could not load plug-in" /
+   "Error loading VST3 preset"** failure on open if left in place.
+4. Open the project. OSCMacro loads in OSCpar's place and receives OSCpar's own state
+   chunk unchanged — Bitwig has no idea the plugin changed, since the class UID now
+   matches. **The OSCpar config adopts automatically** (see below); no manual
+   `mappings.json` editing is needed for prefix, target or macro routing.
+5. Modulator connections carry over automatically too — see "Modulation wiring now
+   survives the device swap" below. Nothing left to rewire.
+
+### Automatic OSCpar config adoption
+
+OSCpar is itself a JUCE plugin, and its state chunk uses JUCE's own `"VC2!"` binary
+format — the same format OSCMacro's `getStateInformation`/`setStateInformation`
+use — so `juce::getXmlFromBinary()` parses it successfully. The chunk's root element
+is `<Preset ...>` rather than OSCMacro's own parameter-tree type, and
+`setStateInformation` now recognizes that shape and converts it instead of rejecting
+it (`src/MappingConfig.cpp`'s `adoptOscParPreset`/`isOscParPreset`, wired in from
+`PluginProcessor.cpp::setStateInformation`). A real, complete OSCpar payload from the
+show project:
 
 ```xml
 <Preset Prefix="lx/mixer/channel/Sunrise/modulation/LevelsA"
-        Address="0.0.0.0" Port="3030">
+        Address="0.0.0.0" Port="3030" FileName="123.xml">
+  <PARAM id="Macro1" value="1.00000"/><PARAM id="Macro2" value="0.36000"/>...
   <Macros><Macro Name="macro1" ScaleMin="0.0" ScaleMax="1.0" Type="0"/>...</Macros>
 </Preset>
 ```
 
-The current show contains 25 such instances. The migration uses an existing local
-`.bwproject` preset extractor (`bwproject.py presets <file>`); that extractor and the
-show project are not part of this repository.
+Conversion rules:
+
+- **Prefix** — OSCpar stores it without a leading slash; OSCMacro's config requires
+  one, so `"lx/mixer/.../LevelsA"` becomes `"/lx/mixer/.../LevelsA"`. An empty/missing
+  Prefix means OSCpar itself was unconfigured, and is left alone exactly like any
+  other unrecognised chunk.
+- **Host** — from the `Address` attribute, except `"0.0.0.0"` — a bind address, not a
+  valid destination, and what every real instance in the show project stores — maps
+  to `"127.0.0.1"`, same as an empty/missing address.
+- **Port** — from `Port`, defaulting to `3030` if absent or unparseable.
+- **Macros** — OSCpar has 10, OSCMacro has 8. Only the first 8 `<Macro>` entries under
+  `<Macros>` are adopted, **matched by position, not by name** — real payloads mix
+  `"macro1"`..`"macro8"` (lowercase) with `"Macro9"`/`"Macro10"` (capitalised), so
+  name-matching would be unreliable even before the 9th/10th are dropped. `Macro9` and
+  `Macro10` are ignored entirely — per the show project, neither was ever modulated,
+  so nothing is lost by the truncation. Each adopted macro's `ScaleMin`/`ScaleMax`
+  become the route's scale range.
+- **Initial values** — the `<PARAM id="MacroN" value="...">` entries (capitalised
+  ids, e.g. `"Macro1"`) carry each macro's last value and become the route's
+  `initial`, matched case-insensitively since nothing about the casing convention is
+  consistent across the payload.
+- **Identity** — OSCMacro normally generates and persists a random UUID; an adopted
+  OSCpar chunk has none, and minting a fresh one on every load would create a new
+  `mappings.json` entry on every project open. Instead the identity is an MD5 hash of
+  the full OSCpar XML payload text, formatted like OSCMacro's normal identities (32
+  lowercase hex characters, no dashes). Verified distinct across all 25 real
+  instances in the target project, including two that share an OSC prefix and differ
+  only in one macro value. **This identity is load-stable only until the next Bitwig
+  save** — once Bitwig saves the project again, OSCMacro persists its own state chunk
+  (with its own generated-UUID lineage, exactly like any other instance) and this
+  derived identity is no longer involved.
+- **Name** — derived from the prefix's last two meaningful path segments, e.g.
+  `"Sunrise/LevelsA"`, `"NightChorus/Moon"`, `"modulation/Globals"` — considerably
+  more useful than `"(unnamed)"` across 25 instances.
+
+On adoption, the converted route self-registers into `mappings.json` through the same
+path a normal cached-state restore uses, so the entry arrives with its full prefix,
+target and macro routes already filled in rather than blank. See
+`tests/OscParAdoptionTests.cpp` for the conversion covered against the real payload
+above.
+
+**Status:** the conversion logic itself is unit-tested against a real OSCpar payload
+(`ctest --test-dir build -R oscpar-adoption`). The end-to-end path — Bitwig handing
+that chunk to a freshly class-UID-patched OSCMacro instance on project open — has not
+been exercised against a live Bitwig project in this session (per this task's
+constraints, Bitwig was not launched); it follows directly from the same
+`getXmlFromBinary`/`setStateInformation` mechanics already verified for OSCMacro's own
+state chunks, but treat it as unverified until checked against a real project open.
 
 ### Modulation wiring now survives the device swap
 
@@ -379,10 +451,9 @@ chosen so they land on OSCpar's exact IDs (`0x08eaca05`–`0x08eaca0c`, i.e.
 `PID8eaca05`–`PID8eaca0c`). See `src/ParamIds.h` for the string table and the
 regression test in `tests/VST3ParamIdTests.cpp` that pins all eight values.
 
-This does **not** make the OSCpar → OSCMacro device swap itself scriptable — see the
-table below, that part is still manual/UI-driven — but it removes the cost that used
-to follow the swap: **once an OSCMacro instance replaces an OSCpar instance on a
-track, Bitwig's existing modulator connections re-attach to it automatically**,
+Combined with automatic config adoption (above), this is what makes the class-UID
+file patch a full swap rather than a partial one: **once OSCMacro occupies OSCpar's
+former slot, Bitwig's existing modulator connections re-attach to it automatically**,
 because the parameter IDs they reference already match. No per-modulator drag
 operations, and no rewriting the human names to match a Bitwig-visible label. The
 human-visible parameter name (`macro1`..`macro8`, what Bitwig's generic panel shows)
@@ -394,31 +465,33 @@ not normally user-visible at all.
 | step | scriptable? |
 |---|---|
 | Back up the project | yes — the `.bwproject` is a single file, just copy it |
-| Extract all 25 OSCpar prefixes, ports and per-macro scaling | **yes** — already working (`bwproject.py presets`) |
-| Merge those routes into self-registered UUID entries, matched by human name | **yes, after the replacement instances have registered** |
-| Replace the OSCpar device with the new plugin in the project file | **no — do not attempt via direct file edits.** Swapping the device means rewriting the VST3 class ID, plugin name, vendor and file path, all length-prefixed strings of different lengths, inside a binary container whose size/offset fields are not understood. One wrong byte and the project will not open. Do this in the Bitwig UI (delete OSCpar, insert OSCMacro) instead. |
-| Re-assign each Bitwig modulator to the new device's parameters | **no longer needed** — the parameter IDs match, so existing modulator connections resolve to the new device automatically once it occupies the same slot. Verify this is actually true on a real project before relying on it broadly (tracked as an open item; not yet exercised end-to-end against a live Bitwig project). |
+| Rewrite the OSCpar device's class UID to OSCMacro's, per instance | **yes — already done, working.** The rewrite is narrow (only the class UID field changes; plugin name, vendor, file path and the device's own state chunk are untouched), which is what makes it safe to script, unlike a full device swap. |
+| Clear Bitwig's stale plugin-state cache before reopening | **yes** — delete `~/Library/Application Support/Bitwig/Bitwig Studio/plugin-states/` entries for the affected devices (or the whole directory; Bitwig regenerates it) |
+| Adopt each instance's OSCpar config (prefix, target, macro scales/initials) into `mappings.json` | **no script needed** — happens automatically inside OSCMacro's `setStateInformation` on project open (see "Automatic OSCpar config adoption" above) |
+| Re-assign each Bitwig modulator to the new device's parameters | **not needed at all** — the parameter IDs match, so existing modulator connections resolve to the new device automatically once it occupies the same slot |
 
-So the realistic remaining cost is UI-driven device replacement across 25 instances
-(delete OSCpar, insert OSCMacro, in the Bitwig UI), not the modulator re-assignment
-that used to follow it. The *addressing* — prefixes, scaling, which macros are live —
-still comes across via the generated/merged `mappings.json` entries as before.
+So the realistic remaining manual step is verifying each migrated track in the Bitwig
+UI after opening — confirming the device loaded as OSCMacro, its modulator
+connections carried over, and its adopted config (prefix/target/macros) looks right —
+not device replacement or modulator rewiring, both of which are now automatic.
 
 Practical approach:
 
 1. Copy the project as a backup.
-2. Add the replacement instances. Each creates an opaque UUID entry in
-   `mappings.json`; give each instance a unique name in its editor.
-3. Generate or merge the extracted OSCpar routes into those registered entries by
-   matching the human names. UUIDs cannot be generated ahead of instantiation.
-4. Migrate **one track at a time**, in the Bitwig UI: insert the OSCMacro instance,
-   confirm its existing modulator connections carried over, then delete the OSCpar
-   instance. Both plugins can coexist during the swap — different class IDs, no
-   conflict — so there is no flag day.
-5. While a track is mid-migration, make sure only one of the two is sending to a
-   given OSC address. Two senders on one address is last-packet-wins and looks like
-   random jitter rather than an obvious failure.
-6. Delete the OSCpar instance once its replacement is verified.
+2. Patch all 25 instances' class UIDs in one pass (external `.bwproject` patcher, not
+   part of this repository).
+3. Clear the plugin-state cache directory.
+4. Open the project. Confirm each track shows OSCMacro (not a "Could not load
+   plug-in" error) with its prior modulator wiring intact.
+5. Spot-check a few instances' editors and `mappings.json` entries against the
+   original OSCpar prefixes/scales to confirm adoption matched expectations,
+   especially any instance where Macro9/Macro10 were in use (they are dropped, not
+   carried forward — see "Automatic OSCpar config adoption" above).
+6. Save the project. From this point on OSCMacro persists its own state chunk per
+   instance (its own generated UUID, not the payload-hash identity used during
+   adoption) — this is also the point after which the adopted identity in
+   `mappings.json` becomes the instance's permanent key, so verify step 5 *before*
+   saving.
 
 ### OSCpar class-ID compatibility declaration
 

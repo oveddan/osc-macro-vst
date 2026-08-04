@@ -358,7 +358,24 @@ public:
             auto state = juce::ValueTree::fromXml (*xml);
 
             if (! state.hasType (parameters.state.getType()))
+            {
+                // Not our own APVTS-derived state. If it's an OSCpar chunk (Bitwig
+                // hands us OSCpar's state when OSCMacro replaces it in place - see
+                // the VST3 class-UID compatibility declaration above), adopt its
+                // routing instead of silently discarding it. Anything else
+                // (unrecognised chunk, or an OSCpar chunk with no Prefix, i.e.
+                // "unconfigured") falls through unchanged, exactly as before.
+                if (oscmacro::isOscParPreset (*xml))
+                {
+                    oscmacro::OscParAdoption adoption;
+
+                    if (oscmacro::adoptOscParPreset (*xml, xml->toString(), adoption).wasOk())
+                        adoptResolvedIdentity (adoption.identity, adoption.name,
+                                              adoption.identity, adoption.resolvedJson);
+                }
+
                 return;
+            }
 
             const auto restoredIdentity = state.getProperty ("instanceIdentity").toString().trim();
             const auto restoredName = state.getProperty ("instanceName", "(unnamed)")
@@ -367,27 +384,8 @@ public:
             auto restoredCachedIdentity = state.getProperty ("cachedMappingIdentity")
                                               .toString().trim();
 
-            {
-                const juce::ScopedLock lock (stateLock);
-
-                if (restoredIdentity.isNotEmpty())
-                    instanceIdentity = restoredIdentity;
-
-                instanceName = restoredName.isNotEmpty() ? restoredName : "(unnamed)";
-
-                if (restoredCachedIdentity.isEmpty() && restoredJson.isNotEmpty())
-                    restoredCachedIdentity = instanceIdentity;
-
-                cachedMappingIdentity = restoredCachedIdentity;
-                cachedMappingJson = restoredJson;
-                resetRequestedIdentity = instanceIdentity;
-                resetAwaitingMapping = true;
-                resetDispatchReady = false;
-                resetInProgress.store (true, std::memory_order_release);
-                persistedNameEditRevision = nameEditRevision;
-            }
-
-            identityRevision.fetch_add (1, std::memory_order_release);
+            adoptResolvedIdentity (restoredIdentity, restoredName,
+                                   restoredCachedIdentity, restoredJson);
 
             state.removeProperty ("instanceIdentity", nullptr);
             state.removeProperty ("instanceName", nullptr);
@@ -462,6 +460,39 @@ private:
                  identityRevision.load (std::memory_order_acquire),
                  nameEditRevision,
                  persistedNameEditRevision };
+    }
+
+    // Adopts a resolved identity/name/cached-mapping triple, whether it came
+    // from OSCMacro's own persisted state or (see setStateInformation) from a
+    // converted OSCpar chunk. Queues the reset-on-load dispatch and a worker
+    // reload exactly as a normal state restore does, so an adopted OSCpar
+    // route self-registers into mappings.json the same way.
+    void adoptResolvedIdentity (const juce::String& restoredIdentity,
+                                const juce::String& restoredName,
+                                juce::String restoredCachedIdentity,
+                                const juce::String& restoredJson)
+    {
+        {
+            const juce::ScopedLock lock (stateLock);
+
+            if (restoredIdentity.isNotEmpty())
+                instanceIdentity = restoredIdentity;
+
+            instanceName = restoredName.isNotEmpty() ? restoredName : "(unnamed)";
+
+            if (restoredCachedIdentity.isEmpty() && restoredJson.isNotEmpty())
+                restoredCachedIdentity = instanceIdentity;
+
+            cachedMappingIdentity = restoredCachedIdentity;
+            cachedMappingJson = restoredJson;
+            resetRequestedIdentity = instanceIdentity;
+            resetAwaitingMapping = true;
+            resetDispatchReady = false;
+            resetInProgress.store (true, std::memory_order_release);
+            persistedNameEditRevision = nameEditRevision;
+        }
+
+        identityRevision.fetch_add (1, std::memory_order_release);
     }
 
     void updateResolvedMapping (const oscmacro::Mapping& mapping,
