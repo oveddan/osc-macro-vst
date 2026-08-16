@@ -173,13 +173,13 @@ with the probe plugin and read the log.
 | # | case | expected | status |
 |---|---|---|---|
 | 1 | Copy a track containing the VST into **another project** | Config travels in the state chunk; no file entry needed; instance keeps working | Implied by the moved-file test; **verify explicitly** |
-| 2 | **Two Bitwig tabs** open, one audio engine active, both containing an instance with the same name; edit the config file | Both loaded instances may adopt the edit, but only an instance receiving recent process callbacks may own and send to the destination | **implemented, untested** |
+| 2 | **Two Bitwig tabs** open, one audio engine active, both containing an instance with the same name; edit the config file | Both loaded instances may adopt the edit, but only an activated instance may own and send to the destination | **implemented, untested** |
 | 3 | Same UUID present in **two unrelated projects** (a track copied between them); edit the file | Both get updated — they share one config entry | **untested**; related to the deferred duplication limitation |
 | 4 | **Duplicate a track within one project** | Two instances share a UUID and one config entry; the active destination registry lets one send and reports a collision on the other | **known limitation, deferred** — see "Duplicating a track" |
 | 5 | Project moved to another machine **without** the config file | Cached state keeps everything working | **verified** |
 | 6 | **Offline bounce / render** | OSC suppressed — a bounce must not disturb a live rig | implemented, **unverified** |
 | 7 | **Device turned off** | Processing and modulation stop; recover on re-enable | **verified** — known limitation, keep devices enabled |
-| 8 | **Silent track while transport runs**, other tracks producing audio | Modulation continues | **untested — highest remaining risk.** Distinct from stopped transport; this is the per-device smart-suspend case and the actual show condition |
+| 8 | **Silent track while transport runs**, other tracks producing audio | Modulation continues | **confirmed broken by the user, then fixed — retest.** The per-device smart-suspend case and the actual show condition. Symptom: the instance sent OSC only while its plugin window was open. Root cause: OSCMacro declared itself a VST3 **effect**, and Bitwig sleeps an effect whose audio input is silent. OSCpar does not have the bug because it declares `Instrument\|Synth`. Fixed by matching OSCpar (see "Why this is an instrument") plus two hardening changes: an infinite tail length, and a stale process heartbeat downgraded from a hard stop to a status annotation |
 | 9 | **Malformed or invalid config file** | Keep last valid mapping, report in `~/.osc-macro/plugin.log` | implemented, **unverified** |
 | 10 | Two active instances configured to the **same OSC destination** | Detect, log, suppress until resolved; inactive instances relinquish ownership | implemented, **unverified** |
 | 11 | **Reset-on-load**: save mid-timeline with macros at non-zero, reopen | Macros return to their configured initial value (default 0), not the saved position | **verified** — macro2 saved at 0.83 and reopened at 0.0 |
@@ -319,14 +319,38 @@ not currently prune their entries, so remove confirmed orphans by hand when need
 ### Runtime behavior
 
 - A dedicated worker performs all file and UDP work; the audio callback only reads
-  host state and passes audio through.
+  host state and emits silence.
 - Values coalesced and sent at no more than 50Hz with epsilon suppression.
 - Full snapshots after mapping/connect changes and every five seconds.
 - Offline processing suppresses OSC.
 - Duplicate destinations within the process are suppressed and logged.
-- Destination ownership requires a recent process callback. This prevents a loaded
-  but inactive Bitwig tab from permanently winning the process-wide collision
-  registry; ownership is retried when processing resumes.
+- Destination ownership follows activation (`prepareToPlay` / `releaseResources`),
+  not the process callback. A deactivated instance — an inactive Bitwig tab, a
+  disabled device — stops its worker and releases the destination.
+- The plugin also reports an **infinite tail length**, and if the host suspends it
+  anyway, OSC keeps flowing with the last known values while the status line reads
+  `sending: host suspended, values held` rather than going silent.
+
+### Why this is an instrument, not an effect
+
+OSCMacro declares the VST3 sub-category `Instrument|Synth`, has a MIDI input it
+ignores, and has **no audio input bus** — it emits silence. This mirrors OSCpar
+exactly, and it is load-bearing rather than cosmetic.
+
+Bitwig's per-device smart-suspend sleeps an *effect* device whose audio input is
+silent. A suspended device stops receiving `processBlock()` calls, and VST3 delivers
+parameter and modulation changes only during `processBlock()` — so modulation
+freezes and OSC output stops until something wakes the device again. Opening the
+plugin window is one such thing, which is why the bug first looked like "it only
+works when the plugin is visible". An instrument has no audio input to be silent
+and is not suspended this way; this is precisely why OSCpar never showed the
+problem.
+
+The instrument declaration also matches the device slot OSCpar occupied in migrated
+projects. The plugin's VST3 class UID is unchanged, so projects already using
+OSCMacro still resolve to the same plugin — but Bitwig may need a plugin rescan to
+pick up the new category, and a device already placed in an FX slot is worth
+re-checking after the upgrade.
 
 ---
 

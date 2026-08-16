@@ -241,9 +241,10 @@ class OSCMacroProcessor final : public juce::AudioProcessor,
                                 private juce::AsyncUpdater
 {
 public:
+    // Output-only, like OSCpar: an instrument with no audio input bus. See
+    // IS_SYNTH in CMakeLists.txt for why the effect layout was a bug.
     OSCMacroProcessor()
         : AudioProcessor (BusesProperties()
-                              .withInput ("Input", juce::AudioChannelSet::stereo(), true)
                               .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
           // Keep the legacy ValueTree type so existing Bitwig state chunks restore.
           parameters (*this, nullptr, "ChromatikMacro", createParameterLayout()),
@@ -262,10 +263,22 @@ public:
     }
 
     const juce::String getName() const override { return JucePlugin_Name; }
-    bool acceptsMidi() const override { return false; }
+    // Notes are ignored; the event input exists only so the VST3 instrument
+    // declaration matches OSCpar's and Bitwig treats the device identically.
+    bool acceptsMidi() const override { return true; }
     bool producesMidi() const override { return false; }
     bool isMidiEffect() const override { return false; }
-    double getTailLengthSeconds() const override { return 0.0; }
+    // Reported as an infinite tail (VST3 kInfiniteTail). This plugin emits silence,
+    // so acoustically the tail is zero - but a zero tail invites a host to sleep a
+    // device it believes has nothing left to produce, and a sleeping device stops
+    // receiving processBlock() and therefore stops receiving VST3 parameter
+    // changes, freezing modulation. Declaring the instrument category (see
+    // CMakeLists.txt) is what actually fixed the Bitwig case; this is belt and
+    // braces for other hosts.
+    double getTailLengthSeconds() const override
+    {
+        return std::numeric_limits<double>::infinity();
+    }
 
     int getNumPrograms() override { return 1; }
     int getCurrentProgram() override { return 0; }
@@ -291,11 +304,9 @@ public:
 
     bool isBusesLayoutSupported (const BusesLayout& layouts) const override
     {
-        const auto& input = layouts.getMainInputChannelSet();
         const auto& output = layouts.getMainOutputChannelSet();
-        return input == output
-            && (output == juce::AudioChannelSet::mono()
-                || output == juce::AudioChannelSet::stereo());
+        return output == juce::AudioChannelSet::mono()
+            || output == juce::AudioChannelSet::stereo();
     }
 
     template <typename Sample>
@@ -306,10 +317,9 @@ public:
         lastProcessBlockMs.store (juce::Time::getMillisecondCounter(),
                                   std::memory_order_release);
 
-        for (auto channel = getTotalNumInputChannels();
-             channel < getTotalNumOutputChannels();
-             ++channel)
-            buffer.clear (channel, 0, buffer.getNumSamples());
+        // No audio input bus, so nothing to pass through: emit silence. The macro
+        // values reach the worker thread through the APVTS atomics, not here.
+        buffer.clear();
     }
 
     void processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer&) override
@@ -828,6 +838,7 @@ private:
             ownsDestination = false;
             activeSourceJson.clear();
             fullSnapshotNeeded = true;
+            suspensionReported = false;
         }
 
         void sendValues (uint32_t now)
@@ -855,28 +866,31 @@ private:
                 return;
             }
 
+            // A stale process heartbeat means the host has suspended the device, so
+            // modulation has stopped arriving and the macro values are frozen. It is
+            // NOT a reason to stop sending: the last known values are still the
+            // correct ones to hold on the wire, and a receiver that restarts must
+            // still get its periodic snapshot. Report it, keep sending.
             const auto lastProcess = processor.lastProcessBlockMs.load (
                 std::memory_order_acquire);
             const auto processAge = static_cast<int32_t> (now - lastProcess);
-
-            if (lastProcess == 0
-                || processAge > processingHeartbeatTimeoutMs)
-            {
-                relinquishDestination();
-                processor.setRuntimeStatus (RuntimeState::inactive,
-                                            hasMapping ? targetFor (mapping)
-                                                       : juce::String());
-                wasSuppressed = true;
-                return;
-            }
+            const auto hostSuspended = lastProcess == 0
+                                    || processAge > processingHeartbeatTimeoutMs;
 
             if (wasSuppressed)
             {
                 fullSnapshotNeeded = true;
                 wasSuppressed = false;
+                suspensionReported = false;
+            }
 
-                if (hasMapping && ! collision && connected)
-                    processor.setRuntimeStatus (RuntimeState::sending, targetFor (mapping));
+            if (hostSuspended != suspensionReported && hasMapping && ! collision
+                && connected)
+            {
+                processor.setRuntimeStatus (RuntimeState::sending, targetFor (mapping),
+                                            hostSuspended ? "host suspended, values held"
+                                                          : juce::String());
+                suspensionReported = hostSuspended;
             }
 
             if (! hasMapping || mapping.prefix.isEmpty()
@@ -916,6 +930,7 @@ private:
 
                 fullSnapshotNeeded = true;
                 processor.setRuntimeStatus (RuntimeState::sending, targetFor (mapping));
+                suspensionReported = false;
             }
 
             const auto periodicSnapshot = now - lastSnapshot >= snapshotIntervalMs;
@@ -1045,6 +1060,7 @@ private:
         bool ownsDestination = false;
         bool fullSnapshotNeeded = true;
         bool wasSuppressed = false;
+        bool suspensionReported = false;
     };
 
     void handleAsyncUpdate() override

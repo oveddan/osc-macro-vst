@@ -18,8 +18,16 @@ juce_add_plugin(OSCMacro
   FORMATS VST3
   PRODUCT_NAME "OSCMacro"
   COMPANY_NAME "oveddan"
-  IS_SYNTH FALSE
-  NEEDS_MIDI_INPUT FALSE
+  # OSCMacro is an instrument, not an effect - matching OSCpar, which declares
+  # the VST3 category "Instrument|Synth" and a MIDI input. This is not cosmetic:
+  # Bitwig's per-device smart-suspend sleeps an *effect* whose input is silent,
+  # which stops processBlock() and therefore stops VST3 parameter delivery, so
+  # modulation freezes and OSC stops until something wakes the device (opening
+  # its plugin window, for instance). An instrument has no audio input to be
+  # silent and is never suspended this way. It also matches the device slot
+  # OSCpar occupied in migrated projects.
+  IS_SYNTH TRUE
+  NEEDS_MIDI_INPUT TRUE
   NEEDS_MIDI_OUTPUT FALSE
   IS_MIDI_EFFECT FALSE
   EDITOR_WANTS_KEYBOARD_FOCUS FALSE
