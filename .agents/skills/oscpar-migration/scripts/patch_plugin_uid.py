@@ -22,10 +22,20 @@ def main():
         print(__doc__)
         return 1
     src, dst, old, new = sys.argv[1:]
+
+    # Validate the character set, not just the length. A typo such as 'G' in the
+    # new UID would otherwise sail through every offset and ZIP assertion below --
+    # they all check that the file stayed structurally intact, which it would --
+    # and write a project referencing a class UID no host can resolve.
+    for label, value in (("old", old), ("new", new)):
+        if len(value) != 32 or any(c not in "0123456789abcdefABCDEF" for c in value):
+            print(f"{label} UID must be exactly 32 hexadecimal characters, got {value!r}")
+            return 1
+
+    # These appear uppercase in the project file (see the module docstring). Match
+    # that form rather than failing on a lowercase paste.
+    old, new = old.upper(), new.upper()
     old_b, new_b = old.encode(), new.encode()
-    if len(old_b) != 32 or len(new_b) != 32:
-        print("UIDs must be exactly 32 hex characters")
-        return 1
 
     raw = open(src, 'rb').read()
     zip_off = raw.find(b'PK\x03\x04')
@@ -59,6 +69,9 @@ def main():
     assert out.find(b'PK\x03\x04') == zip_off, "zip offset moved"
     assert int(out[32:40], 16) == zip_off, "header offset no longer matches"
     assert out.count(old_b) == 0, "old UID still present"
+    # "No occurrences left" is also true when there were none to begin with, which
+    # would mean the old UID never matched and this wrote an unchanged copy.
+    assert n_body + n_zip > 0, f"old UID {old} not found in {src} -- nothing patched"
     zipfile.ZipFile(dst).testzip()
 
     print(f"body: {n_body} UID strings replaced (length unchanged)")

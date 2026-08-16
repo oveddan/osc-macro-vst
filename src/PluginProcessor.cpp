@@ -128,21 +128,49 @@ bool hasEnabledRoute (const oscmacro::Mapping& mapping)
     return false;
 }
 
+// Leases each OSC destination to one instance in this process, so two instances
+// aimed at the same address cannot produce last-packet-wins jitter.
+//
+// A lease carries the holder's liveness. An instance whose host has suspended it
+// keeps sending held values while nothing else wants the destination, but it must
+// not lock out an instance that is actually processing - that is the two-Bitwig-tab
+// case, where the tab without the audio engine can stop receiving processBlock()
+// without ever being deactivated. So a live claimant preempts a suspended holder,
+// and holders renew their leases every tick to learn when they have been preempted.
 class DestinationRegistry
 {
 public:
-    static bool acquire (const void* owner, const oscmacro::Mapping& mapping)
+    static bool acquire (const void* owner, const oscmacro::Mapping& mapping, bool live)
     {
         auto keys = keysFor (mapping);
         const std::scoped_lock lock (mutex());
 
         for (const auto& key : keys)
             if (const auto found = destinations().find (key);
-                found != destinations().end() && found->second != owner)
+                found != destinations().end() && found->second.owner != owner
+                && ! (live && ! found->second.live))
                 return false;
 
         for (const auto& key : keys)
-            destinations()[key] = owner;
+            destinations()[key] = { owner, live };
+
+        return true;
+    }
+
+    // Renews an existing lease and reports whether it survived. False means another
+    // instance preempted it, and the caller must stop sending to that destination.
+    static bool renew (const void* owner, const oscmacro::Mapping& mapping, bool live)
+    {
+        auto keys = keysFor (mapping);
+        const std::scoped_lock lock (mutex());
+
+        for (const auto& key : keys)
+            if (const auto found = destinations().find (key);
+                found == destinations().end() || found->second.owner != owner)
+                return false;
+
+        for (const auto& key : keys)
+            destinations()[key].live = live;
 
         return true;
     }
@@ -152,13 +180,19 @@ public:
         const std::scoped_lock lock (mutex());
 
         for (auto iterator = destinations().begin(); iterator != destinations().end();)
-            if (iterator->second == owner)
+            if (iterator->second.owner == owner)
                 iterator = destinations().erase (iterator);
             else
                 ++iterator;
     }
 
 private:
+    struct Lease
+    {
+        const void* owner = nullptr;
+        bool live = false;
+    };
+
     static std::vector<std::string> keysFor (const oscmacro::Mapping& mapping)
     {
         std::vector<std::string> keys;
@@ -177,9 +211,9 @@ private:
         return instance;
     }
 
-    static std::map<std::string, const void*>& destinations()
+    static std::map<std::string, Lease>& destinations()
     {
-        static std::map<std::string, const void*> instance;
+        static std::map<std::string, Lease> instance;
         return instance;
     }
 };
@@ -897,13 +931,24 @@ private:
                 || ! hasEnabledRoute (mapping))
                 return;
 
+            // Renew first, so a lease lost to a live instance is noticed before this
+            // one sends anything else to that destination.
+            if (ownsDestination
+                && ! DestinationRegistry::renew (this, mapping, ! hostSuspended))
+            {
+                ownsDestination = false;
+                connected = false;
+                sender.disconnect();
+            }
+
             if (! ownsDestination)
             {
                 if (now - lastRegistryAttempt < registryRetryIntervalMs)
                     return;
 
                 lastRegistryAttempt = now;
-                ownsDestination = DestinationRegistry::acquire (this, mapping);
+                ownsDestination = DestinationRegistry::acquire (this, mapping,
+                                                                ! hostSuspended);
                 collision = ! ownsDestination;
 
                 if (collision)

@@ -10,9 +10,13 @@ Incrementing the last character increments the hash by exactly 1, so a single
 prefix yields a consecutive run of IDs -- which is what a bank of macro
 parameters needs.
 
+A run therefore spans at most a single-character suffix -- digits 1 through 9.
+Past that the string grows and the hash jumps, so --count is capped at 9; a
+larger bank needs a prefix solved separately per target.
+
 Usage:
   solve_param_ids.py 0x08eaca05          # find a prefix, print the run of 8
-  solve_param_ids.py 0x08eaca05 --count 10
+  solve_param_ids.py 0x08eaca05 --count 9
   solve_param_ids.py --verify Jlkb~q     # show what a known prefix produces
 
 Verified: this reproduces "Jlkb~q" for OSCpar's 0x08eaca05..0x08eaca0c, and
@@ -93,6 +97,17 @@ def main():
 
     target = int(args[0], 0)
     count = int(args[args.index('--count') + 1]) if '--count' in args else 8
+
+    # The consecutive-ID property comes from incrementing the last character by
+    # one, so it holds only while the suffix stays a single character. At "10" the
+    # string grows and the hash jumps somewhere unrelated (0x08eaca05 --count 10
+    # runs ...0c, 0d, then 0x146e76cb), which would silently hand back a tenth ID
+    # that breaks the compatibility this script exists to guarantee.
+    if not 1 <= count <= 9:
+        print(f"--count must be between 1 and 9, got {count}; a longer run would "
+              "need a different prefix solved per target, as consecutive hashes "
+              "only hold across a single-character suffix")
+        return 1
 
     prefix = solve(target)
     if prefix is None:

@@ -324,9 +324,14 @@ not currently prune their entries, so remove confirmed orphans by hand when need
 - Full snapshots after mapping/connect changes and every five seconds.
 - Offline processing suppresses OSC.
 - Duplicate destinations within the process are suppressed and logged.
-- Destination ownership follows activation (`prepareToPlay` / `releaseResources`),
-  not the process callback. A deactivated instance — an inactive Bitwig tab, a
-  disabled device — stops its worker and releases the destination.
+- Destination leases are **preemptable by liveness**. A deactivated instance — an
+  inactive Bitwig tab, a disabled device — stops its worker and releases its
+  destinations outright. An instance the host has merely *suspended* keeps its
+  lease and keeps sending held values, but an instance that is actually receiving
+  process callbacks takes the lease from it. Holders renew every tick and stop
+  sending as soon as they discover they have been preempted. Without that, a
+  suspended instance in a background tab would hold the destination forever and
+  lock out the tab doing the real work.
 - The plugin also reports an **infinite tail length**, and if the host suspends it
   anyway, OSC keeps flowing with the last known values while the status line reads
   `sending: host suspended, values held` rather than going silent.
