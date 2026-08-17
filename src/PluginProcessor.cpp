@@ -1,4 +1,5 @@
 #include "MappingConfig.h"
+#include "ParamIds.h"
 
 #include <juce_audio_utils/juce_audio_utils.h>
 #include <juce_osc/juce_osc.h>
@@ -76,16 +77,47 @@ juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout()
 
     for (auto index = 0; index < oscmacro::macroCount; ++index)
     {
-        const auto id = "macro" + juce::String (index + 1);
+        // ParameterID is the cryptic VST3-compatibility string (see ParamIds.h);
+        // the second argument is the human-visible name, which stays "macroN".
         layout.add (std::make_unique<juce::AudioParameterFloat> (
-            juce::ParameterID { id, 1 },
-            id,
+            juce::ParameterID { oscmacro::paramIds[static_cast<size_t> (index)], 1 },
+            oscmacro::paramName (index),
             juce::NormalisableRange<float> { 0.0f, 1.0f },
             0.0f));
     }
 
     return layout;
 }
+
+// Whether to advertise VST3 class-ID compatibility with OSCpar (see
+// OSCMacroVST3ClientExtensions below). Flip to false to disable without
+// deleting the implementation - whether Bitwig honours VST3
+// IPluginCompatibility / getCompatibleClasses() declarations at all is
+// UNTESTED.
+constexpr bool advertiseOscParCompatibility = true;
+
+// OSCpar's VST3 class UID, formatted exactly as
+// juce::VST3ClientExtensions::getCompatibleClasses() documents: "a
+// 32-character string consisting only of the characters 0-9 and A-F".
+//
+// This is a *compatibility* declaration, not identity impersonation: OSCMacro
+// keeps its own VST3 class UID (derived from PLUGIN_MANUFACTURER_CODE /
+// PLUGIN_CODE in CMakeLists.txt, both unchanged). This only tells a host that
+// implements IPluginCompatibility that this plugin can stand in for OSCpar -
+// it does not claim to *be* OSCpar.
+constexpr auto oscParCompatibleClassId = "ABCDEF019182FAEB4550666C4F534368";
+
+class OSCMacroVST3ClientExtensions final : public juce::VST3ClientExtensions
+{
+public:
+    std::vector<juce::String> getCompatibleClasses() const override
+    {
+        if (! advertiseOscParCompatibility)
+            return {};
+
+        return { juce::String (oscParCompatibleClassId) };
+    }
+};
 
 bool hasEnabledRoute (const oscmacro::Mapping& mapping)
 {
@@ -96,21 +128,49 @@ bool hasEnabledRoute (const oscmacro::Mapping& mapping)
     return false;
 }
 
+// Leases each OSC destination to one instance in this process, so two instances
+// aimed at the same address cannot produce last-packet-wins jitter.
+//
+// A lease carries the holder's liveness. An instance whose host has suspended it
+// keeps sending held values while nothing else wants the destination, but it must
+// not lock out an instance that is actually processing - that is the two-Bitwig-tab
+// case, where the tab without the audio engine can stop receiving processBlock()
+// without ever being deactivated. So a live claimant preempts a suspended holder,
+// and holders renew their leases every tick to learn when they have been preempted.
 class DestinationRegistry
 {
 public:
-    static bool acquire (const void* owner, const oscmacro::Mapping& mapping)
+    static bool acquire (const void* owner, const oscmacro::Mapping& mapping, bool live)
     {
         auto keys = keysFor (mapping);
         const std::scoped_lock lock (mutex());
 
         for (const auto& key : keys)
             if (const auto found = destinations().find (key);
-                found != destinations().end() && found->second != owner)
+                found != destinations().end() && found->second.owner != owner
+                && ! (live && ! found->second.live))
                 return false;
 
         for (const auto& key : keys)
-            destinations()[key] = owner;
+            destinations()[key] = { owner, live };
+
+        return true;
+    }
+
+    // Renews an existing lease and reports whether it survived. False means another
+    // instance preempted it, and the caller must stop sending to that destination.
+    static bool renew (const void* owner, const oscmacro::Mapping& mapping, bool live)
+    {
+        auto keys = keysFor (mapping);
+        const std::scoped_lock lock (mutex());
+
+        for (const auto& key : keys)
+            if (const auto found = destinations().find (key);
+                found == destinations().end() || found->second.owner != owner)
+                return false;
+
+        for (const auto& key : keys)
+            destinations()[key].live = live;
 
         return true;
     }
@@ -120,13 +180,19 @@ public:
         const std::scoped_lock lock (mutex());
 
         for (auto iterator = destinations().begin(); iterator != destinations().end();)
-            if (iterator->second == owner)
+            if (iterator->second.owner == owner)
                 iterator = destinations().erase (iterator);
             else
                 ++iterator;
     }
 
 private:
+    struct Lease
+    {
+        const void* owner = nullptr;
+        bool live = false;
+    };
+
     static std::vector<std::string> keysFor (const oscmacro::Mapping& mapping)
     {
         std::vector<std::string> keys;
@@ -145,9 +211,9 @@ private:
         return instance;
     }
 
-    static std::map<std::string, const void*>& destinations()
+    static std::map<std::string, Lease>& destinations()
     {
-        static std::map<std::string, const void*> instance;
+        static std::map<std::string, Lease> instance;
         return instance;
     }
 };
@@ -209,9 +275,10 @@ class OSCMacroProcessor final : public juce::AudioProcessor,
                                 private juce::AsyncUpdater
 {
 public:
+    // Output-only, like OSCpar: an instrument with no audio input bus. See
+    // IS_SYNTH in CMakeLists.txt for why the effect layout was a bug.
     OSCMacroProcessor()
         : AudioProcessor (BusesProperties()
-                              .withInput ("Input", juce::AudioChannelSet::stereo(), true)
                               .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
           // Keep the legacy ValueTree type so existing Bitwig state chunks restore.
           parameters (*this, nullptr, "ChromatikMacro", createParameterLayout()),
@@ -220,7 +287,7 @@ public:
     {
         for (auto index = 0; index < oscmacro::macroCount; ++index)
             macros[static_cast<size_t> (index)] =
-                parameters.getRawParameterValue ("macro" + juce::String (index + 1));
+                parameters.getRawParameterValue (oscmacro::paramIds[static_cast<size_t> (index)]);
     }
 
     ~OSCMacroProcessor() override
@@ -230,10 +297,22 @@ public:
     }
 
     const juce::String getName() const override { return JucePlugin_Name; }
-    bool acceptsMidi() const override { return false; }
+    // Notes are ignored; the event input exists only so the VST3 instrument
+    // declaration matches OSCpar's and Bitwig treats the device identically.
+    bool acceptsMidi() const override { return true; }
     bool producesMidi() const override { return false; }
     bool isMidiEffect() const override { return false; }
-    double getTailLengthSeconds() const override { return 0.0; }
+    // Reported as an infinite tail (VST3 kInfiniteTail). This plugin emits silence,
+    // so acoustically the tail is zero - but a zero tail invites a host to sleep a
+    // device it believes has nothing left to produce, and a sleeping device stops
+    // receiving processBlock() and therefore stops receiving VST3 parameter
+    // changes, freezing modulation. Declaring the instrument category (see
+    // CMakeLists.txt) is what actually fixed the Bitwig case; this is belt and
+    // braces for other hosts.
+    double getTailLengthSeconds() const override
+    {
+        return std::numeric_limits<double>::infinity();
+    }
 
     int getNumPrograms() override { return 1; }
     int getCurrentProgram() override { return 0; }
@@ -259,11 +338,9 @@ public:
 
     bool isBusesLayoutSupported (const BusesLayout& layouts) const override
     {
-        const auto& input = layouts.getMainInputChannelSet();
         const auto& output = layouts.getMainOutputChannelSet();
-        return input == output
-            && (output == juce::AudioChannelSet::mono()
-                || output == juce::AudioChannelSet::stereo());
+        return output == juce::AudioChannelSet::mono()
+            || output == juce::AudioChannelSet::stereo();
     }
 
     template <typename Sample>
@@ -274,10 +351,9 @@ public:
         lastProcessBlockMs.store (juce::Time::getMillisecondCounter(),
                                   std::memory_order_release);
 
-        for (auto channel = getTotalNumInputChannels();
-             channel < getTotalNumOutputChannels();
-             ++channel)
-            buffer.clear (channel, 0, buffer.getNumSamples());
+        // No audio input bus, so nothing to pass through: emit silence. The macro
+        // values reach the worker thread through the APVTS atomics, not here.
+        buffer.clear();
     }
 
     void processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer&) override
@@ -292,6 +368,12 @@ public:
 
     bool supportsDoublePrecisionProcessing() const override { return true; }
     bool hasEditor() const override { return true; }
+
+    juce::VST3ClientExtensions* getVST3ClientExtensions() override
+    {
+        return &vst3ClientExtensions;
+    }
+
     juce::AudioProcessorEditor* createEditor() override
     {
         return new OSCMacroEditor (*this);
@@ -320,7 +402,24 @@ public:
             auto state = juce::ValueTree::fromXml (*xml);
 
             if (! state.hasType (parameters.state.getType()))
+            {
+                // Not our own APVTS-derived state. If it's an OSCpar chunk (Bitwig
+                // hands us OSCpar's state when OSCMacro replaces it in place - see
+                // the VST3 class-UID compatibility declaration above), adopt its
+                // routing instead of silently discarding it. Anything else
+                // (unrecognised chunk, or an OSCpar chunk with no Prefix, i.e.
+                // "unconfigured") falls through unchanged, exactly as before.
+                if (oscmacro::isOscParPreset (*xml))
+                {
+                    oscmacro::OscParAdoption adoption;
+
+                    if (oscmacro::adoptOscParPreset (*xml, xml->toString(), adoption).wasOk())
+                        adoptResolvedIdentity (adoption.identity, adoption.name,
+                                              adoption.identity, adoption.resolvedJson);
+                }
+
                 return;
+            }
 
             const auto restoredIdentity = state.getProperty ("instanceIdentity").toString().trim();
             const auto restoredName = state.getProperty ("instanceName", "(unnamed)")
@@ -329,27 +428,8 @@ public:
             auto restoredCachedIdentity = state.getProperty ("cachedMappingIdentity")
                                               .toString().trim();
 
-            {
-                const juce::ScopedLock lock (stateLock);
-
-                if (restoredIdentity.isNotEmpty())
-                    instanceIdentity = restoredIdentity;
-
-                instanceName = restoredName.isNotEmpty() ? restoredName : "(unnamed)";
-
-                if (restoredCachedIdentity.isEmpty() && restoredJson.isNotEmpty())
-                    restoredCachedIdentity = instanceIdentity;
-
-                cachedMappingIdentity = restoredCachedIdentity;
-                cachedMappingJson = restoredJson;
-                resetRequestedIdentity = instanceIdentity;
-                resetAwaitingMapping = true;
-                resetDispatchReady = false;
-                resetInProgress.store (true, std::memory_order_release);
-                persistedNameEditRevision = nameEditRevision;
-            }
-
-            identityRevision.fetch_add (1, std::memory_order_release);
+            adoptResolvedIdentity (restoredIdentity, restoredName,
+                                   restoredCachedIdentity, restoredJson);
 
             state.removeProperty ("instanceIdentity", nullptr);
             state.removeProperty ("instanceName", nullptr);
@@ -424,6 +504,39 @@ private:
                  identityRevision.load (std::memory_order_acquire),
                  nameEditRevision,
                  persistedNameEditRevision };
+    }
+
+    // Adopts a resolved identity/name/cached-mapping triple, whether it came
+    // from OSCMacro's own persisted state or (see setStateInformation) from a
+    // converted OSCpar chunk. Queues the reset-on-load dispatch and a worker
+    // reload exactly as a normal state restore does, so an adopted OSCpar
+    // route self-registers into mappings.json the same way.
+    void adoptResolvedIdentity (const juce::String& restoredIdentity,
+                                const juce::String& restoredName,
+                                juce::String restoredCachedIdentity,
+                                const juce::String& restoredJson)
+    {
+        {
+            const juce::ScopedLock lock (stateLock);
+
+            if (restoredIdentity.isNotEmpty())
+                instanceIdentity = restoredIdentity;
+
+            instanceName = restoredName.isNotEmpty() ? restoredName : "(unnamed)";
+
+            if (restoredCachedIdentity.isEmpty() && restoredJson.isNotEmpty())
+                restoredCachedIdentity = instanceIdentity;
+
+            cachedMappingIdentity = restoredCachedIdentity;
+            cachedMappingJson = restoredJson;
+            resetRequestedIdentity = instanceIdentity;
+            resetAwaitingMapping = true;
+            resetDispatchReady = false;
+            resetInProgress.store (true, std::memory_order_release);
+            persistedNameEditRevision = nameEditRevision;
+        }
+
+        identityRevision.fetch_add (1, std::memory_order_release);
     }
 
     void updateResolvedMapping (const oscmacro::Mapping& mapping,
@@ -538,7 +651,7 @@ private:
             if (! enabled[static_cast<size_t> (index)])
                 continue;
 
-            if (auto* parameter = parameters.getParameter ("macro" + juce::String (index + 1)))
+            if (auto* parameter = parameters.getParameter (oscmacro::paramIds[static_cast<size_t> (index)]))
                 parameter->setValueNotifyingHost (
                     parameter->convertTo0to1 (values[static_cast<size_t> (index)]));
         }
@@ -759,6 +872,7 @@ private:
             ownsDestination = false;
             activeSourceJson.clear();
             fullSnapshotNeeded = true;
+            suspensionReported = false;
         }
 
         void sendValues (uint32_t now)
@@ -786,33 +900,46 @@ private:
                 return;
             }
 
+            // A stale process heartbeat means the host has suspended the device, so
+            // modulation has stopped arriving and the macro values are frozen. It is
+            // NOT a reason to stop sending: the last known values are still the
+            // correct ones to hold on the wire, and a receiver that restarts must
+            // still get its periodic snapshot. Report it, keep sending.
             const auto lastProcess = processor.lastProcessBlockMs.load (
                 std::memory_order_acquire);
             const auto processAge = static_cast<int32_t> (now - lastProcess);
-
-            if (lastProcess == 0
-                || processAge > processingHeartbeatTimeoutMs)
-            {
-                relinquishDestination();
-                processor.setRuntimeStatus (RuntimeState::inactive,
-                                            hasMapping ? targetFor (mapping)
-                                                       : juce::String());
-                wasSuppressed = true;
-                return;
-            }
+            const auto hostSuspended = lastProcess == 0
+                                    || processAge > processingHeartbeatTimeoutMs;
 
             if (wasSuppressed)
             {
                 fullSnapshotNeeded = true;
                 wasSuppressed = false;
+                suspensionReported = false;
+            }
 
-                if (hasMapping && ! collision && connected)
-                    processor.setRuntimeStatus (RuntimeState::sending, targetFor (mapping));
+            if (hostSuspended != suspensionReported && hasMapping && ! collision
+                && connected)
+            {
+                processor.setRuntimeStatus (RuntimeState::sending, targetFor (mapping),
+                                            hostSuspended ? "host suspended, values held"
+                                                          : juce::String());
+                suspensionReported = hostSuspended;
             }
 
             if (! hasMapping || mapping.prefix.isEmpty()
                 || ! hasEnabledRoute (mapping))
                 return;
+
+            // Renew first, so a lease lost to a live instance is noticed before this
+            // one sends anything else to that destination.
+            if (ownsDestination
+                && ! DestinationRegistry::renew (this, mapping, ! hostSuspended))
+            {
+                ownsDestination = false;
+                connected = false;
+                sender.disconnect();
+            }
 
             if (! ownsDestination)
             {
@@ -820,7 +947,8 @@ private:
                     return;
 
                 lastRegistryAttempt = now;
-                ownsDestination = DestinationRegistry::acquire (this, mapping);
+                ownsDestination = DestinationRegistry::acquire (this, mapping,
+                                                                ! hostSuspended);
                 collision = ! ownsDestination;
 
                 if (collision)
@@ -847,6 +975,7 @@ private:
 
                 fullSnapshotNeeded = true;
                 processor.setRuntimeStatus (RuntimeState::sending, targetFor (mapping));
+                suspensionReported = false;
             }
 
             const auto periodicSnapshot = now - lastSnapshot >= snapshotIntervalMs;
@@ -976,6 +1105,7 @@ private:
         bool ownsDestination = false;
         bool fullSnapshotNeeded = true;
         bool wasSuppressed = false;
+        bool suspensionReported = false;
     };
 
     void handleAsyncUpdate() override
@@ -1004,6 +1134,7 @@ private:
     }
 
     juce::AudioProcessorValueTreeState parameters;
+    OSCMacroVST3ClientExtensions vst3ClientExtensions;
     std::array<std::atomic<float>*, oscmacro::macroCount> macros {};
     std::atomic<bool> active { false };
     std::atomic<bool> offline { false };
