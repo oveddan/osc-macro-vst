@@ -17,6 +17,12 @@ struct MacroRoute
     // Reset persisted host parameter state to initial when a project is loaded.
     // Hand-set macros can retain their saved value by setting resetOnLoad to false.
     bool resetOnLoad = true;
+    // When false (the default) the OSC address suffix is "macroN", which is what every
+    // MacroKnobs-style receiver expects. Set true to send to `path` instead, for a
+    // receiver whose parameter is named something else. Kept as an explicit toggle rather
+    // than inferred from a non-empty path so a path can be parked without taking effect.
+    bool customPath = false;
+    juce::String path;
 };
 
 struct Mapping

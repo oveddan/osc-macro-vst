@@ -175,6 +175,31 @@ juce::Result parseMappingObject (const juce::var& value,
                 macro.resetOnLoad = static_cast<bool> (resetOnLoad);
             }
 
+            if (route->hasProperty ("customPath"))
+            {
+                const auto customPath = route->getProperty ("customPath");
+
+                if (! customPath.isBool())
+                    return juce::Result::fail ("Macro customPath must be a boolean");
+
+                macro.customPath = static_cast<bool> (customPath);
+            }
+
+            if (route->hasProperty ("path"))
+            {
+                const auto pathValue = route->getProperty ("path");
+
+                if (! pathValue.isString())
+                    return juce::Result::fail ("Macro path must be a string");
+
+                macro.path = pathValue.toString().trim();
+            }
+
+            // Fail loudly rather than silently falling back to macroN: a custom path that
+            // quietly reverts sends to a live address that looks configured and is not.
+            if (macro.customPath && macro.path.isEmpty())
+                return juce::Result::fail ("Macro customPath requires a non-empty path");
+
             candidate.macros[static_cast<size_t> (index)] = macro;
         }
     }
@@ -211,10 +236,23 @@ juce::String Mapping::addressFor (int macroIndex) const
     if (prefix.isEmpty())
         return {};
 
-    if (prefix == "/")
-        return "/macro" + juce::String (macroIndex + 1);
+    if (macroIndex < 0 || macroIndex >= macroCount)
+        return {};
 
-    return prefix + "/macro" + juce::String (macroIndex + 1);
+    const auto& route = macros[static_cast<size_t> (macroIndex)];
+
+    auto suffix = (route.customPath && route.path.isNotEmpty())
+                      ? route.path
+                      : "macro" + juce::String (macroIndex + 1);
+
+    // Accept a path written either way; the separator is added below either way.
+    if (suffix.startsWith ("/"))
+        suffix = suffix.substring (1);
+
+    if (prefix == "/")
+        return "/" + suffix;
+
+    return prefix + "/" + suffix;
 }
 
 juce::Result parseMappingsFile (const juce::String& json,
@@ -381,6 +419,11 @@ juce::String mappingToResolvedJson (const Mapping& mapping)
         routeObject->setProperty ("scale", scale);
         routeObject->setProperty ("initial", route.initial);
         routeObject->setProperty ("resetOnLoad", route.resetOnLoad);
+        routeObject->setProperty ("customPath", route.customPath);
+
+        // Round-tripped so a self-registering instance does not drop a configured path.
+        if (route.path.isNotEmpty())
+            routeObject->setProperty ("path", route.path);
         macros->setProperty (juce::Identifier (juce::String (index + 1)), juce::var (routeObject));
     }
 
